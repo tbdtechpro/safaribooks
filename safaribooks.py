@@ -637,6 +637,28 @@ class SafariBooks:
             "subjects": [{"name": t} for t in v2.get("tags", [])],
         }
 
+    def _normalize_v2_chapter(self, v2_ch: dict) -> dict:
+        """Map a v2 epub-chapter object to the v1-compatible dict shape."""
+        files_base = (
+            "https://" + SAFARI_BASE_HOST
+            + "/api/v2/epubs/urn:orm:book:" + self.book_id + "/files"
+        )
+        assets = v2_ch.get("related_assets", {})
+        images = [
+            img.split("/files/")[-1]
+            for img in assets.get("images", [])
+            if "/files/" in img
+        ]
+        stylesheets = [{"url": s} for s in assets.get("stylesheets", [])]
+        return {
+            "title": v2_ch.get("title", ""),
+            "filename": v2_ch["content_url"].split("/")[-1],
+            "content": v2_ch["content_url"],
+            "asset_base_url": files_base,
+            "images": images,
+            "stylesheets": stylesheets,
+        }
+
     def get_book_chapters(self, page=1):
         response = self.requests_provider(urljoin(self.api_url, "chapter/?page=%s" % page))
         if response == 0:

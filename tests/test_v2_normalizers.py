@@ -100,3 +100,78 @@ def test_normalize_v2_book_info_no_cover_key():
     sb = _make_safari_books()
     result = sb._normalize_v2_book_info(V2_BOOK_INFO)
     assert "cover" not in result
+
+
+# Minimal v2 chapter object (first result from epub-chapters endpoint)
+V2_CHAPTER = {
+    "ourn": "urn:orm:book:9781098119058:chapter:cover.html",
+    "title": "Cover",
+    "content_url": "https://learning.oreilly.com/api/v2/epubs/urn:orm:book:9781098119058/files/cover.html",
+    "related_assets": {
+        "images": [
+            "https://learning.oreilly.com/api/v2/epubs/urn:orm:book:9781098119058/files/assets/cover.png"
+        ],
+        "stylesheets": [
+            "https://learning.oreilly.com/api/v2/epubs/urn:orm:book:9781098119058/files/epub.css"
+        ],
+        "audio_files": [],
+        "fonts": [],
+        "html_files": [],
+        "other_assets": [],
+        "scripts": [],
+        "svgs": [],
+        "videos": [],
+    },
+    "indexed_position": 0,
+    "is_skippable": True,
+}
+
+
+def test_normalize_v2_chapter_title():
+    sb = _make_safari_books()
+    result = sb._normalize_v2_chapter(V2_CHAPTER)
+    assert result["title"] == "Cover"
+
+
+def test_normalize_v2_chapter_filename():
+    sb = _make_safari_books()
+    result = sb._normalize_v2_chapter(V2_CHAPTER)
+    assert result["filename"] == "cover.html"
+
+
+def test_normalize_v2_chapter_content_contains_v2():
+    """content URL must contain '/v2/' so existing api_v2_detected logic fires."""
+    sb = _make_safari_books()
+    result = sb._normalize_v2_chapter(V2_CHAPTER)
+    assert "/v2/" in result["content"]
+    assert result["content"].endswith("cover.html")
+
+
+def test_normalize_v2_chapter_asset_base_url():
+    sb = _make_safari_books()
+    result = sb._normalize_v2_chapter(V2_CHAPTER)
+    assert result["asset_base_url"].endswith("/files")
+    assert "9781098119058" in result["asset_base_url"]
+
+
+def test_normalize_v2_chapter_images_are_relative():
+    """Images must be relative paths so existing asset_base_url + '/' + img logic works."""
+    sb = _make_safari_books()
+    result = sb._normalize_v2_chapter(V2_CHAPTER)
+    assert result["images"] == ["assets/cover.png"]
+
+
+def test_normalize_v2_chapter_stylesheets_wrapped():
+    """Stylesheets must be [{"url": ...}] dicts to match v1 format."""
+    sb = _make_safari_books()
+    result = sb._normalize_v2_chapter(V2_CHAPTER)
+    assert result["stylesheets"] == [
+        {"url": "https://learning.oreilly.com/api/v2/epubs/urn:orm:book:9781098119058/files/epub.css"}
+    ]
+
+
+def test_normalize_v2_chapter_no_images():
+    sb = _make_safari_books()
+    chapter = {**V2_CHAPTER, "related_assets": {**V2_CHAPTER["related_assets"], "images": []}}
+    result = sb._normalize_v2_chapter(chapter)
+    assert result["images"] == []
