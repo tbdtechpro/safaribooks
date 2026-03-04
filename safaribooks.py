@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# coding: utf-8
 import re
 import os
 import sys
@@ -13,9 +12,14 @@ import requests
 import traceback
 from html import escape
 from random import random
+from typing import Callable, Optional
 from lxml import html, etree
 from multiprocessing import Process, Queue, Value
 from urllib.parse import urljoin, urlparse, parse_qs, quote_plus
+
+
+class SafariBooksError(Exception):
+    """Raised when SafariBooks encounters an unrecoverable error (TUI/API mode)."""
 
 
 PATH = os.path.dirname(os.path.realpath(__file__))
@@ -47,12 +51,22 @@ class Display:
     SH_BG_RED = "\033[41m" if "win" not in sys.platform else ""
     SH_BG_YELLOW = "\033[43m" if "win" not in sys.platform else ""
 
-    def __init__(self, log_file):
+    def __init__(
+        self,
+        log_file: str,
+        progress_callback: Optional[Callable[[str, float], None]] = None,
+        raise_on_exit: bool = False,
+        quiet: bool = False,
+    ):
         self.output_dir = ""
         self.output_dir_set = False
         self.log_file = os.path.join(PATH, log_file)
+        self.progress_callback = progress_callback
+        self.raise_on_exit = raise_on_exit
+        self.quiet = quiet
+        self._current_stage = ""
 
-        self.logger = logging.getLogger("SafariBooks")
+        self.logger = logging.getLogger("SafariBooks.%s" % log_file)
         self.logger.setLevel(logging.INFO)
         logs_handler = logging.FileHandler(filename=self.log_file)
         logs_handler.setFormatter(self.BASE_FORMAT)
@@ -70,7 +84,8 @@ class Display:
         self.in_error = False
 
         self.state_status = Value("i", 0)
-        sys.excepthook = self.unhandled_exception
+        if not quiet:
+            sys.excepthook = self.unhandled_exception
 
     def set_output_dir(self, output_dir):
         self.info("Output directory:\n    %s" % output_dir)
@@ -79,7 +94,8 @@ class Display:
 
     def unregister(self):
         self.logger.handlers[0].close()
-        sys.excepthook = sys.__excepthook__
+        if not self.quiet:
+            sys.excepthook = sys.__excepthook__
 
     def log(self, message):
         try:
@@ -89,6 +105,8 @@ class Display:
             self.logger.info(message)
 
     def out(self, put):
+        if self.quiet:
+            return
         pattern = "\r{!s}\r{!s}\n"
         try:
             s = pattern.format(" " * self.columns, str(put, "utf-8", "replace"))
@@ -99,10 +117,13 @@ class Display:
         sys.stdout.write(s)
 
     def info(self, message, state=False):
+        self._current_stage = message
         self.log(message)
         output = (self.SH_YELLOW + "[*]" + self.SH_DEFAULT if not state else
                   self.SH_BG_YELLOW + "[-]" + self.SH_DEFAULT) + " %s" % message
         self.out(output)
+        if self.progress_callback:
+            self.progress_callback(message, -1.0)
 
     def error(self, error):
         if not self.in_error:
@@ -115,16 +136,19 @@ class Display:
     def exit(self, error):
         self.error(str(error))
 
-        if self.output_dir_set:
+        if self.output_dir_set and not self.quiet:
             output = (self.SH_YELLOW + "[+]" + self.SH_DEFAULT +
                       " Please delete the output directory '" + self.output_dir + "'"
                       " and restart the program.")
             self.out(output)
 
-        output = self.SH_BG_RED + "[!]" + self.SH_DEFAULT + " Aborting..."
-        self.out(output)
+        if not self.quiet:
+            output = self.SH_BG_RED + "[!]" + self.SH_DEFAULT + " Aborting..."
+            self.out(output)
 
         self.save_last_request()
+        if self.raise_on_exit:
+            raise SafariBooksError(str(error))
         sys.exit(1)
 
     def unhandled_exception(self, _, o, tb):
@@ -137,6 +161,8 @@ class Display:
                      .format(*self.last_request))
 
     def intro(self):
+        if self.quiet:
+            return
         output = self.SH_YELLOW + (r"""
        ____     ___         _
       / __/__ _/ _/__ _____(_)
@@ -186,10 +212,13 @@ class Display:
         bar = int(progress * (self.columns - 11) / 100)
         if self.state_status.value < progress:
             self.state_status.value = progress
-            sys.stdout.write(
-                "\r    " + self.SH_BG_YELLOW + "[" + ("#" * bar).ljust(self.columns - 11, "-") + "]" +
-                self.SH_DEFAULT + ("%4s" % progress) + "%" + ("\n" if progress == 100 else "")
-            )
+            if not self.quiet:
+                sys.stdout.write(
+                    "\r    " + self.SH_BG_YELLOW + "[" + ("#" * bar).ljust(self.columns - 11, "-") + "]" +
+                    self.SH_DEFAULT + ("%4s" % progress) + "%" + ("\n" if progress == 100 else "")
+                )
+            if self.progress_callback:
+                self.progress_callback(self._current_stage, progress / 100.0)
 
     def done(self, epub_file):
         self.info("Done: %s\n\n" % epub_file +
@@ -209,9 +238,13 @@ class Display:
 
         else:
             os.remove(COOKIES_FILE)
-            message += "Out-of-Session%s.\n" % (" (%s)" % response["detail"]) if "detail" in response else "" + \
-                       Display.SH_YELLOW + "[+]" + Display.SH_DEFAULT + \
-                       " Use the `--cred` or `--login` options in order to perform the auth login to Safari."
+            detail = " (%s)" % response["detail"] if "detail" in response else ""
+            message += (
+                "Out-of-Session%s.\n" % detail +
+                Display.SH_YELLOW + "[+]" + Display.SH_DEFAULT +
+                " Please save fresh cookies to `cookies.json` and try again.\n"
+                "    See: https://github.com/lorenzodifuccia/safaribooks/issues/358"
+            )
 
         return message
 
@@ -309,9 +342,20 @@ class SafariBooks:
 
     COOKIE_FLOAT_MAX_AGE_PATTERN = re.compile(r'(max-age=\d*\.\d*)', re.IGNORECASE)
 
-    def __init__(self, args):
+    def __init__(
+        self,
+        args,
+        progress_callback: Optional[Callable[[str, float], None]] = None,
+        raise_on_exit: bool = False,
+        quiet: bool = False,
+    ):
         self.args = args
-        self.display = Display("info_%s.log" % escape(args.bookid))
+        self.display = Display(
+            "info_%s.log" % escape(args.bookid),
+            progress_callback=progress_callback,
+            raise_on_exit=raise_on_exit,
+            quiet=quiet,
+        )
         self.display.intro()
 
         self.session = requests.Session()
@@ -328,13 +372,15 @@ class SafariBooks:
                 self.display.exit("Login: unable to find `cookies.json` file.\n"
                                   "    Please use the `--cred` or `--login` options to perform the login.")
 
-            self.session.cookies.update(json.load(open(COOKIES_FILE)))
+            with open(COOKIES_FILE) as f:
+                self.session.cookies.update(json.load(f))
 
         else:
             self.display.info("Logging into Safari Books Online...", state=True)
             self.do_login(*args.cred)
             if not args.no_cookies:
-                json.dump(self.session.cookies.get_dict(), open(COOKIES_FILE, 'w'))
+                with open(COOKIES_FILE, "w") as f:
+                    json.dump(self.session.cookies.get_dict(), f)
 
         self.check_login()
 
@@ -405,9 +451,11 @@ class SafariBooks:
         self.create_epub()
 
         if not args.no_cookies:
-            json.dump(self.session.cookies.get_dict(), open(COOKIES_FILE, "w"))
+            with open(COOKIES_FILE, "w") as f:
+                json.dump(self.session.cookies.get_dict(), f)
 
-        self.display.done(os.path.join(self.BOOK_PATH, self.book_id + ".epub"))
+        self.epub_path = os.path.join(self.BOOK_PATH, self.book_id + ".epub")
+        self.display.done(self.epub_path)
         self.display.unregister()
 
         if not self.display.in_error and not args.log:
@@ -795,8 +843,8 @@ class SafariBooks:
 
     def save_page_html(self, contents):
         self.filename = self.filename.replace(".html", ".xhtml")
-        open(os.path.join(self.BOOK_PATH, "OEBPS", self.filename), "wb") \
-            .write(self.BASE_HTML.format(contents[0], contents[1]).encode("utf-8", 'xmlcharrefreplace'))
+        with open(os.path.join(self.BOOK_PATH, "OEBPS", self.filename), "wb") as f:
+            f.write(self.BASE_HTML.format(contents[0], contents[1]).encode("utf-8", "xmlcharrefreplace"))
         self.display.log("Created: %s" % self.filename)
 
     def get(self):
@@ -1028,7 +1076,8 @@ class SafariBooks:
         )
 
     def create_epub(self):
-        open(os.path.join(self.BOOK_PATH, "mimetype"), "w").write("application/epub+zip")
+        with open(os.path.join(self.BOOK_PATH, "mimetype"), "w") as f:
+            f.write("application/epub+zip")
         meta_info = os.path.join(self.BOOK_PATH, "META-INF")
         if os.path.isdir(meta_info):
             self.display.log("META-INF directory already exists: %s" % meta_info)
@@ -1036,15 +1085,12 @@ class SafariBooks:
         else:
             os.makedirs(meta_info)
 
-        open(os.path.join(meta_info, "container.xml"), "wb").write(
-            self.CONTAINER_XML.encode("utf-8", "xmlcharrefreplace")
-        )
-        open(os.path.join(self.BOOK_PATH, "OEBPS", "content.opf"), "wb").write(
-            self.create_content_opf().encode("utf-8", "xmlcharrefreplace")
-        )
-        open(os.path.join(self.BOOK_PATH, "OEBPS", "toc.ncx"), "wb").write(
-            self.create_toc().encode("utf-8", "xmlcharrefreplace")
-        )
+        with open(os.path.join(meta_info, "container.xml"), "wb") as f:
+            f.write(self.CONTAINER_XML.encode("utf-8", "xmlcharrefreplace"))
+        with open(os.path.join(self.BOOK_PATH, "OEBPS", "content.opf"), "wb") as f:
+            f.write(self.create_content_opf().encode("utf-8", "xmlcharrefreplace"))
+        with open(os.path.join(self.BOOK_PATH, "OEBPS", "toc.ncx"), "wb") as f:
+            f.write(self.create_toc().encode("utf-8", "xmlcharrefreplace"))
 
         zip_file = os.path.join(PATH, "Books", self.book_id)
         if os.path.isfile(zip_file + ".zip"):
@@ -1095,36 +1141,14 @@ if __name__ == "__main__":
 
     args_parsed = arguments.parse_args()
     if args_parsed.cred or args_parsed.login:
-        print("WARNING: Due to recent changes on ORLY website, \n" \
-                "the `--cred` and `--login` options are temporarily disabled.\n"
-                "    Please use the `cookies.json` file to authenticate your account.\n"
-                "    See: https://github.com/lorenzodifuccia/safaribooks/issues/358")
+        print(
+            "WARNING: Due to recent changes on the O'Reilly website,\n"
+            "the `--cred` and `--login` options are temporarily disabled.\n"
+            "    Please use the `cookies.json` file to authenticate your account.\n"
+            "    Run `python retrieve_cookies.py` or use the TUI (`python tui.py`).\n"
+            "    See: https://github.com/lorenzodifuccia/safaribooks/issues/358"
+        )
         arguments.exit()
-        
-        # user_email = ""
-        # pre_cred = ""
-
-        # if args_parsed.cred:
-        #     pre_cred = args_parsed.cred
-
-        # else:
-        #     user_email = input("Email: ")
-        #     passwd = getpass.getpass("Password: ")
-        #     pre_cred = user_email + ":" + passwd
-
-        # parsed_cred = SafariBooks.parse_cred(pre_cred)
-
-        # if not parsed_cred:
-        #     arguments.error("invalid credential: %s" % (
-        #         args_parsed.cred if args_parsed.cred else (user_email + ":*******")
-        #     ))
-
-        # args_parsed.cred = parsed_cred
-
-    else:
-        if args_parsed.no_cookies:
-            arguments.error("invalid option: `--no-cookies` is valid only if you use the `--cred` option")
 
     SafariBooks(args_parsed)
-    # Hint: do you want to download more then one book once, initialized more than one instance of `SafariBooks`...
     sys.exit(0)
