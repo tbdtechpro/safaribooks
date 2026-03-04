@@ -18,7 +18,6 @@ def test_v2_chapters_template_formats_book_id():
     assert url == "https://learning.oreilly.com/api/v2/epub-chapters/?epub_identifier=urn:orm:book:9781098119058"
 
 
-from unittest.mock import MagicMock
 from safaribooks import SafariBooks, SAFARI_BASE_HOST
 
 # Minimal v2 book info response (as returned by the API)
@@ -218,8 +217,8 @@ def test_normalize_v2_toc_entry_fragment():
     assert result["fragment"] == "preface"
 
 
-def test_normalize_v2_toc_entry_id_fallback_when_no_fragment():
-    """When fragment is empty, id must come from the ourn last segment."""
+def test_normalize_v2_toc_entry_id_always_from_ourn():
+    """id is always derived from the ourn last segment, regardless of fragment."""
     result = SafariBooks._normalize_v2_toc_entry(V2_TOC_ENTRY_NO_FRAGMENT)
     assert result["id"] == "cover.html"
 

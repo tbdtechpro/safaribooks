@@ -1191,6 +1191,10 @@ class SafariBooks:
         response = response.json()
 
         if self.api_v2:
+            if not isinstance(response, list):
+                self.display.exit(self.display.api_error(response) +
+                                  " Don't delete any files, just run again this program"
+                                  " in order to complete the `.epub` creation!")
             response = [self._normalize_v2_toc_entry(e) for e in response]
         elif not isinstance(response, list) and len(response.keys()) == 1:
             self.display.exit(
