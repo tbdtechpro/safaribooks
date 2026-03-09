@@ -32,7 +32,7 @@ from lipgloss import (
     Top,
 )
 
-from safaribooks import COOKIES_FILE, SafariBooks, SafariBooksError
+from safaribooks import COOKIES_FILE, PATH, SafariBooks, SafariBooksError
 from retrieve_cookies import parse_cookie_string, get_oreilly_cookies_from_browser, login_with_credentials
 
 # ── Colours ──────────────────────────────────────────────────────────────────
@@ -80,7 +80,9 @@ class Screen(Enum):
     ADD_BOOK   = auto()
     QUEUE      = auto()
     DOWNLOAD   = auto()
-    CALIBRE    = auto()
+    CALIBRE      = auto()
+    SETTINGS     = auto()
+    CALIBRE_SYNC = auto()
 
 
 # ── Custom messages ───────────────────────────────────────────────────────────
@@ -119,6 +121,23 @@ class CalibreMsg(tea.Msg):
 
 @dataclass
 class AllCalibreDoneMsg(tea.Msg):
+    pass
+
+
+@dataclass
+class CalibreSyncDoneMsg(tea.Msg):
+    entries: list          # list of SyncEntry
+    already_synced: int    # count of definitive matches (hidden from review)
+    skipped: int           # count of books with no EPUB
+    error: str = ""
+
+@dataclass
+class CalibreAddProgressMsg(tea.Msg):
+    book_id: str
+    stage: str             # "adding" | "done" | "error:..."
+
+@dataclass
+class CalibreAddDoneMsg(tea.Msg):
     pass
 
 
@@ -223,6 +242,111 @@ class DownloadWorker:
         self.program.send(AllDownloadsDoneMsg())
 
 
+# ── Export-library worker ─────────────────────────────────────────────────────
+
+class ExportLibraryWorker:
+    """Runs markdown/db/rag exports against existing Books/ downloads in a background thread."""
+
+    def __init__(self, books_dir: str, book_ids: List[str], program: tea.Program,
+                 export_markdown: bool = False, export_db: bool = False,
+                 export_rag: bool = False):
+        self.books_dir      = books_dir
+        self.book_ids       = book_ids   # pre-scanned list in display order
+        self.program        = program
+        self.export_markdown = export_markdown
+        self.export_db      = export_db
+        self.export_rag     = export_rag
+        if export_rag:
+            self.export_db = True
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def start(self):
+        self._thread.start()
+
+    def _run(self):
+        import re as _re
+        from config import load_export_config, book_folder_name
+        from library import BookRegistry, parse_epub_contents
+        books_dir = self.books_dir
+
+        exp_cfg = load_export_config()
+        db_path = exp_cfg.resolved_db_path() or os.path.join(books_dir, "library.db")
+        reg     = BookRegistry(db_path)
+
+        _dir_re = _re.compile(r'^.+\((\w+)\)$')
+
+        for entry in sorted(os.scandir(books_dir), key=lambda e: e.name):
+            if not entry.is_dir():
+                continue
+            m = _dir_re.match(entry.name)
+            if not m:
+                continue
+            book_id  = m.group(1)
+            book_dir = entry.path
+
+            self.program.send(ProgressMsg(book_id, "Parsing EPUB…", 0.05))
+            try:
+                book_info, chapters, toc_data = parse_epub_contents(book_dir)
+            except FileNotFoundError:
+                self.program.send(BookErrorMsg(book_id, "content.opf not found"))
+                continue
+            except Exception as exc:
+                self.program.send(BookErrorMsg(book_id, str(exc)))
+                continue
+
+            title  = book_info.get("title") or book_id
+            folder = book_folder_name(book_info, book_id, exp_cfg.folder_name_style)
+
+            try:
+                markdown_map = None
+                if self.export_markdown:
+                    self.program.send(ProgressMsg(book_id, "Exporting Markdown…", 0.3))
+                    from exporters import MarkdownExporter
+                    md_output_dir = exp_cfg.resolved_markdown_dir()
+                    exporter = MarkdownExporter(
+                        book_id=book_id,
+                        book_path=book_dir,
+                        book_info=book_info,
+                        chapters=chapters,
+                        output_dir=md_output_dir,
+                        folder_name=folder,
+                    )
+                    markdown_map = exporter.export()
+
+                if self.export_db:
+                    self.program.send(ProgressMsg(book_id, "Storing in DB…", 0.7))
+                    reg.store_chapters(
+                        book_id=book_id,
+                        chapters=chapters,
+                        book_path=book_dir,
+                        markdown_map=markdown_map,
+                    )
+                    if toc_data:
+                        reg.store_toc(book_id, toc_data)
+
+                if self.export_rag:
+                    self.program.send(ProgressMsg(book_id, "Exporting RAG JSONL…", 0.9))
+                    from exporters import RagExporter
+                    rag_base = exp_cfg.resolved_rag_dir() or os.path.join(book_dir, "rag")
+                    os.makedirs(rag_base, exist_ok=True)
+                    output_path = os.path.join(rag_base, folder + "_rag.jsonl")
+                    exporter = RagExporter(
+                        book_id=book_id,
+                        book_info=book_info,
+                        chapters=chapters,
+                        book_path=book_dir,
+                        markdown_map=markdown_map,
+                    )
+                    exporter.export(output_path)
+
+                self.program.send(BookDoneMsg(book_id, title, ""))
+            except Exception as exc:
+                self.program.send(BookErrorMsg(book_id, str(exc)))
+
+        reg.close()
+        self.program.send(AllDownloadsDoneMsg())
+
+
 # ── Calibre worker ────────────────────────────────────────────────────────────
 
 class CalibreWorker:
@@ -276,11 +400,14 @@ class CalibreWorker:
 class AppModel(tea.Model):
 
     MENU_ITEMS = [
-        ("Login with Email/Password", Screen.LOGIN),
-        ("Set Session Cookie",        Screen.COOKIE),
-        ("Add Book to Queue",         Screen.ADD_BOOK),
-        ("View / Run Queue",          Screen.QUEUE),
-        ("Quit",                      None),
+        ("Extract Cookies from Browser", "BROWSER"),
+        ("Set Session Cookie (paste)",   Screen.COOKIE),
+        ("Login with Email/Password",    Screen.LOGIN),
+        ("Add Book to Queue",            Screen.ADD_BOOK),
+        ("View / Run Queue",             Screen.QUEUE),
+        ("Sync with Calibre Library",     Screen.CALIBRE_SYNC),
+        ("Export Paths / Settings",      Screen.SETTINGS),
+        ("Quit",                         None),
     ]
 
     def __init__(self):
@@ -323,6 +450,34 @@ class AppModel(tea.Model):
         self.calibre_running: bool = False
         self.all_calibre_done: bool = False
         self.status_msg: str = ""
+        self.dl_label: str = "Downloading"      # header for the download screen
+        self.export_library_mode: bool = False  # True when running export-library
+        self.dl_scroll: int = 0                 # scroll offset for download screen
+
+        # settings screen
+        from config import load_export_config
+        _cfg = load_export_config()
+        self.settings_fields: List[str] = [
+            _cfg.markdown_dir,
+            _cfg.rag_dir,
+            _cfg.db_path,
+            _cfg.folder_name_style,   # "title" or "id"
+        ]
+        self.settings_cursor: int = 0   # which field is focused
+        self.settings_status: str = ""
+
+        # calibre sync screen
+        self.sync_scanning: bool       = False
+        self.sync_entries: list        = []   # list of SyncEntry (non-definitive only)
+        self.sync_already_synced: int  = 0
+        self.sync_skipped: int         = 0
+        self.sync_selected: set        = set()
+        self.sync_cursor: int          = 0
+        self.sync_scroll: int          = 0
+        self.sync_adding: bool         = False
+        self.sync_add_status: dict     = {}   # book_id → "adding"|"done"|"error:msg"
+        self.sync_all_done: bool       = False
+        self.sync_error: str           = ""
 
         # program reference set after Program() creation
         self._program: Optional[tea.Program] = None
@@ -366,7 +521,10 @@ class AppModel(tea.Model):
             return self, None
 
         if isinstance(msg, AllDownloadsDoneMsg):
-            self._start_calibre()
+            if not self.export_library_mode:
+                self._start_calibre()
+            else:
+                self.all_calibre_done = True  # signal "all done" so footer updates
             return self, None
 
         if isinstance(msg, CalibreMsg):
@@ -431,7 +589,9 @@ class AppModel(tea.Model):
             Screen.ADD_BOOK: self._key_add_book,
             Screen.QUEUE:    self._key_queue,
             Screen.DOWNLOAD: self._key_download,
-            Screen.CALIBRE:  self._key_calibre,
+            Screen.CALIBRE:      self._key_calibre,
+            Screen.SETTINGS:     self._key_settings,
+            Screen.CALIBRE_SYNC: self._key_calibre_sync,
         }
         handler = dispatch.get(self.screen)
         if handler:
@@ -448,9 +608,17 @@ class AppModel(tea.Model):
             _, target = self.MENU_ITEMS[self.menu_cursor]
             if target is None:
                 return self, tea.quit_cmd
-            self.screen = target
-            self.cookie_status = ""
-            self.add_book_status = ""
+            if target == "BROWSER":
+                self.screen = Screen.COOKIE
+                self.cookie_status = ""
+                self._retrieve_from_browser()
+            else:
+                if target == Screen.CALIBRE_SYNC:
+                    self._start_calibre_sync()
+                    return self, None
+                self.screen = target
+                self.cookie_status = ""
+                self.add_book_status = ""
         elif key == "q":
             return self, tea.quit_cmd
         return self, None
@@ -547,16 +715,70 @@ class AppModel(tea.Model):
             self.export_rag = not self.export_rag
         elif key in ("k", "K"):
             self.skip_if_downloaded = not self.skip_if_downloaded
+        elif key in ("e", "E"):
+            self._start_export_library()
         return self, None
 
     def _key_download(self, key: str):
-        # nothing interactive during download
+        if self.all_calibre_done and key in ("q", "escape"):
+            self.screen = Screen.MAIN
+            return self, None
+        total = len(self.dl_order)
+        if key in ("up", "k"):
+            self.dl_scroll = max(0, self.dl_scroll - 1)
+        elif key in ("down", "j"):
+            self.dl_scroll = min(max(0, total - 1), self.dl_scroll + 1)
         return self, None
 
     def _key_calibre(self, key: str):
         if self.all_calibre_done and key in ("q", "enter", "escape"):
             return self, tea.quit_cmd
         return self, None
+
+    def _key_settings(self, key: str):
+        n = len(self.settings_fields)
+        if key == "escape":
+            self.screen = Screen.MAIN
+            self.settings_status = ""
+        elif key in ("tab", "down"):
+            self.settings_cursor = (self.settings_cursor + 1) % n
+            self.settings_status = ""
+        elif key in ("shift+tab", "up"):
+            self.settings_cursor = (self.settings_cursor - 1) % n
+            self.settings_status = ""
+        elif key == "enter":
+            self._save_settings()
+        elif self.settings_cursor == 3:
+            # Toggle field — space/enter/left/right cycle between "title" and "id"
+            if key in ("enter", " ", "left", "right", "h", "l"):
+                cur = self.settings_fields[3]
+                self.settings_fields[3] = "id" if cur == "title" else "title"
+                self.settings_status = ""
+        elif key in ("backspace", "delete"):
+            val = self.settings_fields[self.settings_cursor]
+            self.settings_fields[self.settings_cursor] = val[:-1]
+            self.settings_status = ""
+        elif key == "ctrl+u":
+            self.settings_fields[self.settings_cursor] = ""
+            self.settings_status = ""
+        elif len(key) == 1 and key.isprintable():
+            self.settings_fields[self.settings_cursor] += key
+            self.settings_status = ""
+        return self, None
+
+    def _save_settings(self):
+        from config import ExportConfig, save_export_config
+        cfg = ExportConfig(
+            markdown_dir=self.settings_fields[0].strip(),
+            rag_dir=self.settings_fields[1].strip(),
+            db_path=self.settings_fields[2].strip(),
+            folder_name_style=self.settings_fields[3],
+        )
+        try:
+            save_export_config(cfg)
+            self.settings_status = "ok:Settings saved to ~/.safaribooks.toml"
+        except Exception as exc:
+            self.settings_status = f"error:Save failed — {exc}"
 
     # ── Business logic ─────────────────────────────────────────────────────
 
@@ -705,6 +927,9 @@ class AppModel(tea.Model):
             self.books[book_id] = BookState(book_id=book_id)
         self.queue.clear()
 
+        self.dl_label = "Downloading"
+        self.export_library_mode = False
+        self.dl_scroll = 0
         self.screen = Screen.DOWNLOAD
         worker = DownloadWorker(
             self.dl_order, self._program,
@@ -712,6 +937,49 @@ class AppModel(tea.Model):
             export_db=self.export_db,
             export_rag=self.export_rag,
             skip_if_downloaded=self.skip_if_downloaded,
+        )
+        worker.start()
+
+    def _start_export_library(self):
+        if not (self.export_markdown or self.export_db or self.export_rag):
+            self.status_msg = "Select at least one export format (m/d/x) before running."
+            return
+
+        import re as _re
+        books_dir = os.path.join(PATH, "Books")
+        if not os.path.isdir(books_dir):
+            self.status_msg = "Books/ directory not found."
+            return
+
+        # Quick scan — just directory names, no file I/O
+        _dir_re = _re.compile(r'^.+\((\w+)\)$')
+        book_ids = []
+        for entry in sorted(os.scandir(books_dir), key=lambda e: e.name):
+            if entry.is_dir() and _dir_re.match(entry.name):
+                m = _dir_re.match(entry.name)
+                book_ids.append(m.group(1))
+
+        if not book_ids:
+            self.status_msg = "No downloaded books found in Books/."
+            return
+
+        self.dl_order = book_ids
+        self.books = {bid: BookState(book_id=bid) for bid in book_ids}
+        self.all_calibre_done = False
+        self.calibre_running = False
+        self.dl_label = "Exporting Library"
+        self.export_library_mode = True
+        self.dl_scroll = 0
+        self.status_msg = ""
+        self.screen = Screen.DOWNLOAD
+
+        worker = ExportLibraryWorker(
+            books_dir=books_dir,
+            book_ids=book_ids,
+            program=self._program,
+            export_markdown=self.export_markdown,
+            export_db=self.export_db,
+            export_rag=self.export_rag,
         )
         worker.start()
 
@@ -777,7 +1045,9 @@ class AppModel(tea.Model):
             Screen.ADD_BOOK: self._view_add_book,
             Screen.QUEUE:    self._view_queue,
             Screen.DOWNLOAD: self._view_download,
-            Screen.CALIBRE:  self._view_calibre,
+            Screen.CALIBRE:      self._view_calibre,
+            Screen.SETTINGS:     self._view_settings,
+            Screen.CALIBRE_SYNC: self._view_calibre_sync,
         }
         render = views.get(self.screen, self._view_main)
         return render() + "\n"
@@ -791,6 +1061,18 @@ class AppModel(tea.Model):
 
     def _footer(self, hints: str) -> str:
         return hint_style.render(hints)
+
+    def _library_book_count(self) -> int:
+        """Count book directories in Books/ — fast directory scan, no file reads."""
+        import re as _re
+        books_dir = os.path.join(PATH, "Books")
+        if not os.path.isdir(books_dir):
+            return 0
+        _dir_re = _re.compile(r'^.+\((\w+)\)$')
+        return sum(
+            1 for e in os.scandir(books_dir)
+            if e.is_dir() and _dir_re.match(e.name)
+        )
 
     # Main menu ───────────────────────────────────────────────────────────────
 
@@ -814,14 +1096,19 @@ class AppModel(tea.Model):
         lines.append("")
 
         # Menu items
+        lib_count = self._library_book_count()
+        q = len(self.queue)
         for i, (label, _) in enumerate(self.MENU_ITEMS):
-            # Append queue count to the queue item
-            if label == "View / Run Queue":
-                label = f"View / Run Queue  ({len(self.queue)} book{'s' if len(self.queue) != 1 else ''})"
+            is_queue = label == "View / Run Queue"
+            if is_queue:
+                label = "View / Run Queue / Export"
             if i == self.menu_cursor:
                 lines.append(cursor_style.render(f"  ▶ {label}"))
             else:
                 lines.append(f"    {label}")
+            if is_queue:
+                lib_str = f"{lib_count} in library" if lib_count else "library empty"
+                lines.append(hint_style.render(f"      {q} queued · {lib_str}"))
 
         lines.append("")
         lines.append(self._footer("↑/↓  move    Enter  select    q  quit"))
@@ -984,10 +1271,10 @@ class AppModel(tea.Model):
     # Queue screen ────────────────────────────────────────────────────────────
 
     def _view_queue(self) -> str:
-        lines = [self._header("Download Queue"), ""]
+        lines = [self._header("Queue / Export"), ""]
 
         if not self.queue:
-            lines.append(hint_style.render("  Queue is empty."))
+            lines.append(hint_style.render("  Download queue is empty — press 'a' to add books, or 'e' to export existing downloads."))
         else:
             for i, book_id in enumerate(self.queue, 1):
                 lines.append(f"  {i}. {book_id}")
@@ -1024,7 +1311,7 @@ class AppModel(tea.Model):
         lines.append("")
 
         lines.append(self._footer(
-            "a  add    r  run    s  set cookie    c  clear    m/d/x/k  toggles    Esc  back"
+            "a  add    r  run    e  export library    s  set cookie    c  clear    m/d/x/k  toggles    Esc  back"
         ))
         content = "\n".join(lines)
         return panel_style.width(min(self.width - 4, 60)).render(content)
@@ -1032,15 +1319,39 @@ class AppModel(tea.Model):
     # Download screen ─────────────────────────────────────────────────────────
 
     def _view_download(self) -> str:
-        lines = [self._header("Downloading"), ""]
+        total = len(self.dl_order)
+        # Each book renders as 3 lines (id, status, blank). Reserve 4 for
+        # header + footer + scroll indicator.
+        rows_available = max(3, self.height - 4)
+        per_book = 3
+        visible_count = max(1, rows_available // per_book)
 
-        for book_id in self.dl_order:
+        # Auto-scroll: keep the first in-progress book visible
+        active_idx = None
+        for i, bid in enumerate(self.dl_order):
+            b = self.books.get(bid)
+            if b and not b.done and not b.failed:
+                active_idx = i
+                break
+        if active_idx is not None:
+            # Clamp scroll so active book is in window
+            if active_idx < self.dl_scroll:
+                self.dl_scroll = active_idx
+            elif active_idx >= self.dl_scroll + visible_count:
+                self.dl_scroll = active_idx - visible_count + 1
+
+        self.dl_scroll = max(0, min(self.dl_scroll, max(0, total - visible_count)))
+        visible_ids = self.dl_order[self.dl_scroll: self.dl_scroll + visible_count]
+
+        lines = [self._header(self.dl_label), ""]
+
+        for book_id in visible_ids:
             b = self.books.get(book_id)
             if b is None:
                 continue
 
             if b.title:
-                id_line = f"{book_id}  {value_style.render(b.title[:40])}"
+                id_line = f"{book_id}  {value_style.render(b.title[:38])}"
             else:
                 id_line = book_id
 
@@ -1054,10 +1365,22 @@ class AppModel(tea.Model):
                 lines.append(f"  {status}")
             else:
                 lines.append(f"  {id_line}")
-                lines.append(f"  {render_bar(b.percent)}  {hint_style.render(b.stage[:40])}")
+                lines.append(f"  {render_bar(b.percent)}  {hint_style.render(b.stage[:38])}")
             lines.append("")
 
-        lines.append(self._footer("Ctrl+C  cancel"))
+        # Scroll indicator when list is longer than the viewport
+        if total > visible_count:
+            end = min(self.dl_scroll + visible_count, total)
+            scroll_hint = hint_style.render(
+                f"  Showing {self.dl_scroll + 1}–{end} of {total}   ↑/↓ to scroll"
+            )
+            lines.append(scroll_hint)
+            lines.append("")
+
+        if self.all_calibre_done:
+            lines.append(self._footer("↑/↓  scroll    Esc  back to menu    q  quit"))
+        else:
+            lines.append(self._footer("↑/↓  scroll    Ctrl+C  cancel"))
         content = "\n".join(lines)
         return panel_style.width(min(self.width - 4, 72)).render(content)
 
@@ -1091,6 +1414,109 @@ class AppModel(tea.Model):
         else:
             lines.append(self._footer("Ctrl+C  cancel"))
 
+        content = "\n".join(lines)
+        return panel_style.width(min(self.width - 4, 72)).render(content)
+
+    # Settings screen ─────────────────────────────────────────────────────────
+
+    def _view_settings(self) -> str:
+        lines = [self._header("Export Paths / Settings"), ""]
+
+        box_w = min(self.width - 12, 56)
+
+        # (label, placeholder when empty, sub-hint shown below field, field index)
+        field_defs = [
+            ("Markdown output dir",
+             "blank = next to each book in Books/",
+             "e.g. ~/Documents/Books/MD  — one subfolder per book is created inside",
+             0),
+            ("RAG JSONL output dir",
+             "blank = next to each book in Books/",
+             "e.g. ~/Documents/Books/RAG  — all JSONL files land flat inside",
+             1),
+            ("Library DB path",
+             "blank = Books/library.db",
+             "e.g. ~/Documents/Books/library.db  — full path to the SQLite file",
+             2),
+        ]
+
+        lines.append(hint_style.render(
+            "  Leave blank to keep the default path inside each book's folder."
+        ))
+        lines.append(hint_style.render(
+            "  Paths support ~ (e.g. ~/Documents/Books).  Tab/↓ to move.  Enter to save."
+        ))
+        lines.append("")
+
+        for label, placeholder, sub_hint, idx in field_defs:
+            focused = self.settings_cursor == idx
+            val = self.settings_fields[idx]
+            cursor  = "█" if focused else ""
+            border_color = C_ACCENT if focused else C_MUTED
+            box = (
+                Style()
+                .border(normal_border())
+                .border_foreground(border_color)
+                .padding(0, 1)
+                .width(box_w)
+                .render((val + cursor) if val else (hint_style.render(placeholder) + cursor))
+            )
+            lbl = (accent_style if focused else label_style).render(label)
+            lines.append(lbl)
+            lines.append(box)
+            lines.append(hint_style.render(f"  ↳ {sub_hint}"))
+            lines.append("")
+
+        # Toggle: folder name style
+        focused = self.settings_cursor == 3
+        style_val = self.settings_fields[3] or "title"
+        title_sel = accent_style.render("[ Title ]") if style_val == "title" else hint_style.render("[ Title ]")
+        id_sel    = accent_style.render("[ ID ]")    if style_val == "id"    else hint_style.render("[ ID ]")
+        lbl = (accent_style if focused else label_style).render("Folder name style")
+        toggle_row = f"  {title_sel}  {id_sel}"
+        if focused:
+            toggle_row += "  " + hint_style.render("← → or Space to switch")
+        lines.append(lbl)
+        lines.append(toggle_row)
+        lines.append(hint_style.render("  ↳ How export subfolders are named — by book title or numeric book ID"))
+        lines.append("")
+
+        if self.settings_status:
+            kind, _, msg = self.settings_status.partition(":")
+            if kind == "ok":
+                lines.append(success_style.render("✓ " + msg))
+            else:
+                lines.append(error_style.render("✗ " + msg))
+            lines.append("")
+
+        lines.append(self._footer("Tab/↓  next field    Enter  save    Ctrl+U  clear    Space  toggle    Esc  back"))
+        content = "\n".join(lines)
+        return panel_style.width(min(self.width - 4, 68)).render(content)
+
+    # ── Calibre sync screen ────────────────────────────────────────────────
+
+    def _start_calibre_sync(self):
+        self.sync_scanning    = True
+        self.sync_entries     = []
+        self.sync_selected    = set()
+        self.sync_cursor      = 0
+        self.sync_scroll      = 0
+        self.sync_adding      = False
+        self.sync_add_status  = {}
+        self.sync_all_done    = False
+        self.sync_error       = ""
+        self.screen           = Screen.CALIBRE_SYNC
+
+    def _key_calibre_sync(self, key: str):
+        if key == "escape":
+            self.screen = Screen.MAIN
+        return self, None
+
+    def _view_calibre_sync(self) -> str:
+        lines = [self._header("Sync with Calibre Library"), ""]
+        lines.append("  Scanning…" if self.sync_scanning else "  (not yet implemented)")
+        lines.append("")
+        lines.append(self._footer("Esc  back"))
         content = "\n".join(lines)
         return panel_style.width(min(self.width - 4, 72)).render(content)
 
