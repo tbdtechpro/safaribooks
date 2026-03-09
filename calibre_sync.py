@@ -33,15 +33,33 @@ def normalize_for_match(text: str) -> str:
 
 
 def parse_calibredb_output(raw: str) -> list:
-    """Parse calibredb --for-machine output, which may be multiple JSON arrays."""
+    """Parse calibredb --for-machine output, which may be multiple JSON arrays concatenated."""
     if not raw.strip():
         return []
+    # calibredb sometimes outputs multiple JSON arrays separated by newlines.
+    # Split on the boundary between them: "]\n[" or "]\r\n["
+    # Then reconstruct each chunk as a valid JSON array and parse it.
+    raw = raw.strip()
     results = []
-    for match in re.finditer(r"\[.*?\]", raw, re.DOTALL):
+    # Try parsing the whole thing as one JSON value first
+    try:
+        data = json.loads(raw)
+        if isinstance(data, list):
+            return data
+    except json.JSONDecodeError:
+        pass
+    # Split on array boundaries and parse each chunk
+    chunks = re.split(r'\]\s*\n\s*\[', raw)
+    for i, chunk in enumerate(chunks):
+        # Re-add the stripped brackets
+        if not chunk.startswith('['):
+            chunk = '[' + chunk
+        if not chunk.endswith(']'):
+            chunk = chunk + ']'
         try:
-            chunk = json.loads(match.group())
-            if isinstance(chunk, list):
-                results.extend(chunk)
+            data = json.loads(chunk)
+            if isinstance(data, list):
+                results.extend(data)
         except json.JSONDecodeError:
             continue
     return results
@@ -65,12 +83,20 @@ def run_calibredb_list() -> tuple:
         return "", "calibredb timed out after 60 seconds"
 
 
+def _normalize_isbn(isbn: str) -> str:
+    """Strip hyphens and spaces from ISBN for comparison."""
+    return re.sub(r"[\s-]", "", isbn)
+
+
 def _book_isbn(book_info: dict) -> str:
-    return (book_info.get("isbn") or "").strip()
+    return _normalize_isbn((book_info.get("isbn") or "").strip())
 
 
 def _calibre_isbn(calibre_book: dict) -> str:
-    return (calibre_book.get("identifiers") or {}).get("isbn", "").strip()
+    identifiers = calibre_book.get("identifiers") or {}
+    if not isinstance(identifiers, dict):
+        return ""
+    return _normalize_isbn(identifiers.get("isbn", "").strip())
 
 
 def _first_author(book_info: dict) -> str:
@@ -111,6 +137,9 @@ def match_books(local_books: list, calibre_books: list) -> List[SyncEntry]:
         epub_path = (lb.get("epub_path") or "").strip()
         if not epub_path:
             continue
+        book_id = lb.get("book_id", "").strip()
+        if not book_id:
+            continue
 
         isbn = _book_isbn(lb)
         title = normalize_for_match(lb.get("title") or "")
@@ -124,8 +153,8 @@ def match_books(local_books: list, calibre_books: list) -> List[SyncEntry]:
             match = "none"
 
         entries.append(SyncEntry(
-            book_id=lb["book_id"],
-            title=lb.get("title") or lb["book_id"],
+            book_id=lb.get("book_id", ""),
+            title=lb.get("title") or lb.get("book_id", ""),
             author=_first_author(lb),
             epub_path=epub_path,
             match=match,

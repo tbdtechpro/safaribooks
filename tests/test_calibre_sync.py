@@ -11,8 +11,10 @@ def test_normalize_strips_punctuation():
 def test_normalize_collapses_whitespace():
     assert normalize_for_match("Fluent  Python") == "fluent python"
 
-def test_normalize_strips_edition_noise():
+def test_normalize_handles_edition_text():
     assert normalize_for_match("Fluent Python, 2nd Edition") == "fluent python 2nd edition"
+
+NESTED_ARRAY = '[{"id":1,"title":"Tagged Book","authors":"Some Author","identifiers":{"isbn":"9780001234567"},"tags":["python","web"]}]'
 
 SINGLE_ARRAY = '[{"id":1,"title":"Clean Code","authors":"Robert C. Martin","identifiers":{"isbn":"9780132350884"}}]'
 DOUBLE_ARRAY = (
@@ -37,6 +39,11 @@ def test_parse_empty_string():
 
 def test_parse_invalid_json_returns_empty():
     assert parse_calibredb_output("not json") == []
+
+def test_parse_nested_arrays_in_object():
+    result = parse_calibredb_output(NESTED_ARRAY)
+    assert len(result) == 1
+    assert result[0]["title"] == "Tagged Book"
 
 LOCAL_BOOKS = [
     {"book_id": "111", "title": "Clean Code", "authors": [{"name": "Robert C. Martin"}],
@@ -79,3 +86,16 @@ def test_no_epub_is_skipped():
 def test_match_count():
     entries = match_books(LOCAL_BOOKS, CALIBRE_BOOKS)
     assert len(entries) == 3
+
+LOCAL_HYPHENATED_ISBN = [
+    {"book_id": "555", "title": "Hyphenated Book", "authors": [{"name": "Author"}],
+     "isbn": "978-0-13-235088-4", "epub_path": "/books/555/book.epub"},
+]
+CALIBRE_PLAIN_ISBN = [
+    {"title": "Hyphenated Book", "authors": "Author", "identifiers": {"isbn": "9780132350884"}},
+]
+
+def test_isbn_hyphenation_matches():
+    entries = match_books(LOCAL_HYPHENATED_ISBN, CALIBRE_PLAIN_ISBN)
+    assert len(entries) == 1
+    assert entries[0].match == "definitive"
