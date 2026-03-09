@@ -426,6 +426,42 @@ class CalibreSyncWorker:
         ))
 
 
+# ── Calibre add worker ────────────────────────────────────────────────────────
+
+class CalibreAddWorker:
+    """Runs `calibredb add` for each selected SyncEntry."""
+
+    def __init__(self, entries: list, program: tea.Program):
+        self.entries = entries
+        self.program = program
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def start(self):
+        self._thread.start()
+
+    def _run(self):
+        for entry in self.entries:
+            self.program.send(CalibreAddProgressMsg(entry.book_id, "adding"))
+            try:
+                result = subprocess.run(
+                    ["calibredb", "add", entry.epub_path],
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                )
+                if result.returncode == 0:
+                    self.program.send(CalibreAddProgressMsg(entry.book_id, "done"))
+                else:
+                    err = (result.stderr or result.stdout or "unknown error").strip()[:80]
+                    self.program.send(CalibreAddProgressMsg(entry.book_id, f"error:{err}"))
+            except subprocess.TimeoutExpired:
+                self.program.send(CalibreAddProgressMsg(entry.book_id, "error:timed out"))
+            except Exception as exc:
+                self.program.send(CalibreAddProgressMsg(entry.book_id, f"error:{exc}"))
+
+        self.program.send(CalibreAddDoneMsg())
+
+
 # ── Calibre worker ────────────────────────────────────────────────────────────
 
 class CalibreWorker:
@@ -625,6 +661,15 @@ class AppModel(tea.Model):
                 self.sync_selected = {
                     e.book_id for e in msg.entries if e.match == "none"
                 }
+            return self, None
+
+        if isinstance(msg, CalibreAddProgressMsg):
+            self.sync_add_status[msg.book_id] = msg.stage
+            return self, None
+
+        if isinstance(msg, CalibreAddDoneMsg):
+            self.sync_adding   = False
+            self.sync_all_done = True
             return self, None
 
         if isinstance(msg, LoginResultMsg):
@@ -1780,7 +1825,11 @@ class AppModel(tea.Model):
         return panel_style.width(min(self.width - 4, 72)).render("\n".join(lines))
 
     def _start_calibre_add(self, entries: list):
-        pass  # implemented in Task 5
+        self.sync_adding     = True
+        self.sync_all_done   = False
+        self.sync_add_status = {e.book_id: "queued" for e in entries}
+        worker = CalibreAddWorker(entries=entries, program=self._program)
+        worker.start()
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
