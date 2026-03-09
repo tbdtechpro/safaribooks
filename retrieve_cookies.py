@@ -123,8 +123,9 @@ def login_with_credentials(email: str, password: str) -> dict:
 def get_oreilly_cookies_from_browser() -> dict:
     """Try to load O'Reilly cookies from the local browser profile.
 
-    Requires browser_cookie3. May fail silently on modern Chrome (Linux/macOS)
-    when the OS keyring is not accessible from the current session.
+    Requires browser_cookie3. Tries Firefox first (most reliable on Linux),
+    then Chrome/Chromium. Each browser is attempted independently so a missing
+    or locked profile in one browser does not abort the whole extraction.
     """
     try:
         import browser_cookie3
@@ -138,19 +139,36 @@ def get_oreilly_cookies_from_browser() -> dict:
         return {}
 
     orly_domains = {"oreilly.com", "learning.oreilly.com", "api.oreilly.com"}
-    try:
-        cj = browser_cookie3.load(domain_name=".oreilly.com")
-    except Exception as exc:
-        print(f"[!] browser_cookie3 failed: {exc}", file=sys.stderr)
-        return {}
 
-    cookies = {}
-    for c in cj:
-        domain = c.domain.lstrip(".")
-        if domain in orly_domains or domain.endswith(".oreilly.com"):
-            if c.value:  # skip cookies that came back empty (encryption failure)
-                cookies[c.name] = c.value
-    return cookies
+    # Try browsers in priority order; each may raise if the profile is absent
+    # or encrypted by a keyring we can't reach.
+    browsers = [
+        ("Firefox",  getattr(browser_cookie3, "firefox",  None)),
+        ("Chrome",   getattr(browser_cookie3, "chrome",   None)),
+        ("Chromium", getattr(browser_cookie3, "chromium", None)),
+    ]
+
+    errors = []
+    for browser_name, browser_fn in browsers:
+        if browser_fn is None:
+            continue
+        try:
+            cj = browser_fn(domain_name=".oreilly.com")
+            cookies = {}
+            for c in cj:
+                domain = c.domain.lstrip(".")
+                if domain in orly_domains or domain.endswith(".oreilly.com"):
+                    if c.value:  # skip empty values (decryption failures)
+                        cookies[c.name] = c.value
+            if cookies:
+                return cookies
+        except Exception as exc:
+            errors.append(f"{browser_name}: {exc}")
+            continue
+
+    if errors:
+        print(f"[!] browser_cookie3 — no cookies found. Errors: {'; '.join(errors)}", file=sys.stderr)
+    return {}
 
 
 def save_cookies(cookies: dict) -> None:

@@ -225,13 +225,23 @@ def _table_to_md(table_el) -> str:
 class MarkdownExporter:
     """Convert an OEBPS book directory to GFM Markdown files."""
 
-    def __init__(self, book_id: str, book_path: str, book_info: dict, chapters: list):
+    def __init__(self, book_id: str, book_path: str, book_info: dict, chapters: list,
+                 output_dir: str = "", folder_name: str = ""):
+        """
+        output_dir:  if set, markdown files go to {output_dir}/{folder_name}/
+                     instead of the default {book_path}/markdown/.
+        folder_name: the subdirectory name inside output_dir (defaults to book_id
+                     when output_dir is set but folder_name is not supplied).
+        """
         self.book_id = book_id
         self.book_path = book_path
         self.book_info = book_info
         self.chapters = chapters
         self.oebps = os.path.join(book_path, "OEBPS")
-        self.md_dir = os.path.join(book_path, "markdown")
+        if output_dir:
+            self.md_dir = os.path.join(output_dir, folder_name or book_id)
+        else:
+            self.md_dir = os.path.join(book_path, "markdown")
 
     def export(self) -> dict:
         """Export all chapters to markdown/ subfolder.
@@ -249,7 +259,13 @@ class MarkdownExporter:
             xhtml_path = os.path.join(self.oebps, filename)
             if not os.path.isfile(xhtml_path):
                 continue
-            md = self._convert_xhtml(xhtml_path)
+            try:
+                md = self._convert_xhtml(xhtml_path)
+            except RecursionError:
+                # Some XHTML files have pathologically deep nesting; skip gracefully.
+                md = f"*(Chapter conversion failed: XHTML nesting too deep for {filename})*"
+            except Exception as exc:
+                md = f"*(Chapter conversion failed: {exc})*"
             markdown_map[filename] = md
             self._write_chapter_md(filename, md)
 

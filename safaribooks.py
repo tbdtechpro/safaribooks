@@ -1218,7 +1218,6 @@ class SafariBooks:
         """Run optional post-download exports based on CLI flags."""
         args = self.args
         books_dir = os.path.join(PATH, "Books")
-        db_path = os.path.join(books_dir, "library.db")
 
         do_registry = True  # always record downloads
         do_markdown = getattr(args, "export_markdown", False)
@@ -1228,6 +1227,12 @@ class SafariBooks:
         # RAG implies content DB
         if do_rag:
             do_db = True
+
+        # Load user-configured paths (falls back to defaults when not set)
+        from config import book_folder_name, load_export_config
+        exp_cfg = load_export_config()
+        db_path = exp_cfg.resolved_db_path() or os.path.join(books_dir, "library.db")
+        folder  = book_folder_name(self.book_info, self.book_id, exp_cfg.folder_name_style)
 
         api_version = "v2" if self.api_v2 else "v1"
 
@@ -1242,21 +1247,24 @@ class SafariBooks:
             chapters=self.book_chapters,
             api_version=api_version,
         )
-        self.display.info("Registry: download recorded in library.db")
+        self.display.info("Registry: download recorded in %s" % db_path)
 
         # Feature 2 — Markdown export
         markdown_map = None
         if do_markdown:
             from exporters import MarkdownExporter
             self.display.info("Exporting Markdown...", state=True)
+            md_output_dir = exp_cfg.resolved_markdown_dir()
             exporter = MarkdownExporter(
                 book_id=self.book_id,
                 book_path=self.BOOK_PATH,
                 book_info=self.book_info,
                 chapters=self.book_chapters,
+                output_dir=md_output_dir,
+                folder_name=folder,
             )
             markdown_map = exporter.export()
-            self.display.info("Markdown export complete: %s/markdown/" % self.BOOK_PATH)
+            self.display.info("Markdown export complete: %s" % exporter.md_dir)
 
         # Feature 3 — Content DB
         if do_db:
@@ -1269,14 +1277,14 @@ class SafariBooks:
             toc_data = getattr(self, "_toc_data", None)
             if toc_data:
                 reg.store_toc(self.book_id, toc_data)
-            self.display.info("Content DB: chapters/TOC stored in library.db")
+            self.display.info("Content DB: chapters/TOC stored in %s" % db_path)
 
         # Feature 4 — RAG JSONL export
         if do_rag:
             from exporters import RagExporter
-            rag_dir = os.path.join(self.BOOK_PATH, "rag")
-            os.makedirs(rag_dir, exist_ok=True)
-            output_path = os.path.join(rag_dir, self.book_id + "_rag.jsonl")
+            rag_base = exp_cfg.resolved_rag_dir() or os.path.join(self.BOOK_PATH, "rag")
+            os.makedirs(rag_base, exist_ok=True)
+            output_path = os.path.join(rag_base, folder + "_rag.jsonl")
             self.display.info("Exporting RAG JSONL...", state=True)
             exporter = RagExporter(
                 book_id=self.book_id,
@@ -1335,6 +1343,11 @@ if __name__ == "__main__":
         help="Scan existing Books/ directories and populate library.db, then exit."
     )
     arguments.add_argument(
+        "--export-library", dest="export_library", action='store_true',
+        help="Run exports (--export-markdown / --export-db / --export-rag) against all"
+             " existing Books/ downloads without re-downloading anything."
+    )
+    arguments.add_argument(
         "--export-markdown", dest="export_markdown", action='store_true',
         help="Write a GFM Markdown version of the book into Books/{title}/markdown/."
     )
@@ -1369,6 +1382,107 @@ if __name__ == "__main__":
         n = reg.scan_existing_books(books_dir)
         reg.close()
         print("Scan complete. %d book(s) added to library.db." % n)
+        sys.exit(0)
+
+    # --export-library: re-export all existing downloads, no auth/network needed
+    if args_parsed.export_library:
+        import os as _os
+        import re as _re
+        from config import load_export_config
+        from library import BookRegistry, parse_epub_contents
+        books_dir = _os.path.join(PATH, "Books")
+        if not _os.path.isdir(books_dir):
+            print("Books/ directory not found. Nothing to export.")
+            sys.exit(0)
+
+        do_markdown = getattr(args_parsed, "export_markdown", False)
+        do_db       = getattr(args_parsed, "export_db", False)
+        do_rag      = getattr(args_parsed, "export_rag", False)
+        if do_rag:
+            do_db = True
+
+        if not (do_markdown or do_db or do_rag):
+            print("No export format requested. Add --export-markdown, --export-db, or --export-rag.")
+            sys.exit(0)
+
+        from config import book_folder_name as _book_folder_name
+        exp_cfg = load_export_config()
+        db_path = exp_cfg.resolved_db_path() or _os.path.join(books_dir, "library.db")
+        reg = BookRegistry(db_path)
+        n_ok = n_err = 0
+
+        for entry in sorted(_os.scandir(books_dir), key=lambda e: e.name):
+            if not entry.is_dir():
+                continue
+            m = _re.match(r'^.+\((\w+)\)$', entry.name)
+            if not m:
+                continue
+            book_id  = m.group(1)
+            book_dir = entry.path
+
+            try:
+                book_info, chapters, toc_data = parse_epub_contents(book_dir)
+            except FileNotFoundError:
+                print("  [skip] %s — content.opf not found" % entry.name)
+                continue
+            except Exception as exc:
+                print("  [err]  %s — %s" % (entry.name, exc))
+                n_err += 1
+                continue
+
+            folder = _book_folder_name(book_info, book_id, exp_cfg.folder_name_style)
+            label  = book_info.get("title") or entry.name
+            print("Processing: %s" % label)
+
+            try:
+                markdown_map = None
+                if do_markdown:
+                    from exporters import MarkdownExporter
+                    md_output_dir = exp_cfg.resolved_markdown_dir()
+                    exporter = MarkdownExporter(
+                        book_id=book_id,
+                        book_path=book_dir,
+                        book_info=book_info,
+                        chapters=chapters,
+                        output_dir=md_output_dir,
+                        folder_name=folder,
+                    )
+                    markdown_map = exporter.export()
+                    print("  → Markdown: %s" % exporter.md_dir)
+
+                if do_db:
+                    reg.store_chapters(
+                        book_id=book_id,
+                        chapters=chapters,
+                        book_path=book_dir,
+                        markdown_map=markdown_map,
+                    )
+                    if toc_data:
+                        reg.store_toc(book_id, toc_data)
+                    print("  → DB: chapters/TOC stored")
+
+                if do_rag:
+                    from exporters import RagExporter
+                    rag_base = exp_cfg.resolved_rag_dir() or _os.path.join(book_dir, "rag")
+                    _os.makedirs(rag_base, exist_ok=True)
+                    output_path = _os.path.join(rag_base, folder + "_rag.jsonl")
+                    exporter = RagExporter(
+                        book_id=book_id,
+                        book_info=book_info,
+                        chapters=chapters,
+                        book_path=book_dir,
+                        markdown_map=markdown_map,
+                    )
+                    exporter.export(output_path)
+                    print("  → RAG JSONL: %s" % output_path)
+
+                n_ok += 1
+            except Exception as exc:
+                print("  [err]  export failed — %s" % exc)
+                n_err += 1
+
+        reg.close()
+        print("\nDone. %d book(s) exported, %d error(s)." % (n_ok, n_err))
         sys.exit(0)
 
     if args_parsed.bookid is None:

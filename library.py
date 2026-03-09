@@ -313,3 +313,139 @@ def _sha256_file(path: str) -> str:
 
 def _text(el) -> str:
     return el.text if el is not None and el.text else ""
+
+
+# ------------------------------------------------------------------
+# EPUB content parser (no download required)
+# ------------------------------------------------------------------
+
+def parse_epub_contents(book_dir: str) -> tuple:
+    """Parse an existing EPUB directory and return (book_info, chapters, toc_data).
+
+    Reads OEBPS/content.opf for metadata and spine order, and OEBPS/toc.ncx
+    for hierarchical chapter titles.
+
+    Returns:
+        book_info  — dict compatible with MarkdownExporter / RagExporter
+        chapters   — list of {"filename": str, "title": str} in spine order
+        toc_data   — nested list of TOC entry dicts for BookRegistry.store_toc()
+
+    Raises FileNotFoundError if content.opf is missing.
+    """
+    import xml.etree.ElementTree as ET
+
+    OPF_NS  = "http://www.idpf.org/2007/opf"
+    DC_NS   = "http://purl.org/dc/elements/1.1/"
+    NCX_NS  = "http://www.daisy.org/z3986/2005/ncx/"
+
+    opf_path = os.path.join(book_dir, "OEBPS", "content.opf")
+    if not os.path.isfile(opf_path):
+        raise FileNotFoundError(f"content.opf not found in {book_dir}")
+
+    tree = ET.parse(opf_path)
+    root = tree.getroot()
+
+    # ── Metadata ─────────────────────────────────────────────────────────────
+    meta = root.find(f"{{{OPF_NS}}}metadata")
+    if meta is None:
+        meta = root.find("metadata")  # no-namespace fallback
+
+    def _dc(tag):
+        el = None
+        if meta is not None:
+            el = meta.find(f"{{{DC_NS}}}{tag}")
+        return el.text.strip() if el is not None and el.text else ""
+
+    def _dc_all(tag):
+        if meta is None:
+            return []
+        return [el.text.strip() for el in meta.findall(f"{{{DC_NS}}}{tag}") if el.text]
+
+    title      = _dc("title")
+    isbn       = _dc("identifier")
+    issued     = _dc("date")
+    description= _dc("description")
+    authors    = _dc_all("creator")
+    publishers = _dc_all("publisher")
+    subjects   = _dc_all("subject")
+
+    book_info = {
+        "title":       title,
+        "authors":     [{"name": a} for a in authors],
+        "isbn":        isbn,
+        "issued":      issued,
+        "description": description,
+        "publishers":  publishers,
+        "subjects":    subjects,
+    }
+
+    # ── Manifest: item id → href ──────────────────────────────────────────────
+    manifest = {}
+    for item in root.findall(f".//{{{OPF_NS}}}item"):
+        item_id    = item.get("id", "")
+        href       = item.get("href", "")
+        media_type = item.get("media-type", "")
+        if href.endswith(".xhtml") and media_type == "application/xhtml+xml":
+            manifest[item_id] = href
+
+    # ── Spine: ordered list of hrefs ─────────────────────────────────────────
+    spine_hrefs = []
+    for itemref in root.findall(f".//{{{OPF_NS}}}itemref"):
+        idref = itemref.get("idref", "")
+        if idref in manifest:
+            spine_hrefs.append(manifest[idref])
+
+    # ── NCX TOC: filename → display title (first top-level entry per file) ───
+    file_title: dict = {}
+    toc_data: list = []
+
+    ncx_path = os.path.join(book_dir, "OEBPS", "toc.ncx")
+    if os.path.isfile(ncx_path):
+        try:
+            ncx_tree = ET.parse(ncx_path)
+            ncx_root = ncx_tree.getroot()
+            nav_map  = ncx_root.find(f"{{{NCX_NS}}}navMap")
+            if nav_map is not None:
+                toc_data = _parse_ncx_navmap(nav_map, NCX_NS, file_title, depth=0)
+        except ET.ParseError:
+            pass
+
+    # ── Build chapters list ───────────────────────────────────────────────────
+    chapters = []
+    for href in spine_hrefs:
+        # Use NCX title if available, otherwise derive from filename stem
+        default_title = os.path.splitext(os.path.basename(href))[0].replace("_", " ")
+        chapters.append({
+            "filename": href,
+            "title":    file_title.get(href, default_title),
+        })
+
+    return book_info, chapters, toc_data
+
+
+def _parse_ncx_navmap(nav_map, NCX_NS: str, file_title: dict, depth: int) -> list:
+    """Recursively parse NCX navPoints into a nested list of TOC entry dicts."""
+    entries = []
+    for nav_point in nav_map.findall(f"{{{NCX_NS}}}navPoint"):
+        label_el  = nav_point.find(f"{{{NCX_NS}}}navLabel/{{{NCX_NS}}}text")
+        content_el = nav_point.find(f"{{{NCX_NS}}}content")
+
+        label = label_el.text.strip() if label_el is not None and label_el.text else ""
+        src   = content_el.get("src", "") if content_el is not None else ""
+
+        # src may include a fragment:  "Chapter_1.xhtml#anchor"
+        filename, _, fragment = src.partition("#")
+
+        # Record the first title seen for each file (top-most nav entry = chapter title)
+        if filename and filename not in file_title:
+            file_title[filename] = label
+
+        children = _parse_ncx_navmap(nav_point, NCX_NS, file_title, depth + 1)
+        entries.append({
+            "depth":    depth,
+            "label":    label,
+            "href":     filename,
+            "fragment": fragment,
+            "children": children,
+        })
+    return entries
