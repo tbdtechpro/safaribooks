@@ -34,6 +34,8 @@ ORLY_BASE_URL = "https://www." + ORLY_BASE_HOST
 SAFARI_BASE_URL = "https://" + SAFARI_BASE_HOST
 API_ORIGIN_URL = "https://" + API_ORIGIN_HOST
 PROFILE_URL = SAFARI_BASE_URL + "/profile/"
+API_V2_TEMPLATE = "https://" + SAFARI_BASE_HOST + "/api/v2/epubs/urn:orm:book:{0}/"
+API_V2_CHAPTERS_TEMPLATE = "https://" + SAFARI_BASE_HOST + "/api/v2/epub-chapters/?epub_identifier=urn:orm:book:{0}"
 
 # DEBUG
 USE_PROXY = False
@@ -258,8 +260,7 @@ class WinQueue(list):  # TODO: error while use `process` in Windows: can't pickl
 
 
 class SafariBooks:
-    LOGIN_URL = ORLY_BASE_URL + "/member/auth/login/"
-    LOGIN_ENTRY_URL = SAFARI_BASE_URL + "/login/unified/?next=/home/"
+    LOGIN_URL = API_ORIGIN_URL + "/api/v1/auth/login/"
 
     API_TEMPLATE = SAFARI_BASE_URL + "/api/v1/book/{0}/"
 
@@ -385,6 +386,7 @@ class SafariBooks:
         self.check_login()
 
         self.book_id = args.bookid
+        self.api_v2 = False
         self.api_url = self.API_TEMPLATE.format(self.book_id)
 
         self.display.info("Retrieving book info...")
@@ -485,6 +487,10 @@ class SafariBooks:
                 ), response.text
             )
 
+            self.display.log(
+                "HTTP %d  %s  [%d bytes]" % (response.status_code, url, len(response.content))
+            )
+
         except (requests.ConnectionError, requests.ConnectTimeout, requests.RequestException) as request_exception:
             self.display.error(str(request_exception))
             return 0
@@ -510,58 +516,31 @@ class SafariBooks:
         return new_cred
 
     def do_login(self, email, password):
-        response = self.requests_provider(self.LOGIN_ENTRY_URL)
-        if response == 0:
-            self.display.exit("Login: unable to reach Safari Books Online. Try again...")
-
-        next_parameter = None
-        try:
-            next_parameter = parse_qs(urlparse(response.request.url).query)["next"][0]
-
-        except (AttributeError, ValueError, IndexError):
-            self.display.exit("Login: unable to complete login on Safari Books Online. Try again...")
-
-        redirect_uri = API_ORIGIN_URL + quote_plus(next_parameter)
-
         response = self.requests_provider(
             self.LOGIN_URL,
             is_post=True,
-            json={
-                "email": email,
-                "password": password,
-                "redirect_uri": redirect_uri
-            },
-            perform_redirect=False
+            json={"email": email, "password": password},
         )
 
         if response == 0:
-            self.display.exit("Login: unable to perform auth to Safari Books Online.\n    Try again...")
+            self.display.exit("Login: unable to reach O'Reilly API. Try again...")
 
-        if response.status_code != 200:  # TODO To be reviewed
+        if response.status_code != 200:
             try:
-                error_page = html.fromstring(response.text)
-                errors_message = error_page.xpath("//ul[@class='errorlist']//li/text()")
-                recaptcha = error_page.xpath("//div[@class='g-recaptcha']")
-                messages = (["    `%s`" % error for error in errors_message
-                             if "password" in error or "email" in error] if len(errors_message) else []) + \
-                           (["    `ReCaptcha required (wait or do logout from the website).`"] if len(
-                               recaptcha) else [])
-                self.display.exit(
-                    "Login: unable to perform auth login to Safari Books Online.\n" + self.display.SH_YELLOW +
-                    "[*]" + self.display.SH_DEFAULT + " Details:\n" + "%s" % "\n".join(
-                        messages if len(messages) else ["    Unexpected error!"])
-                )
-            except (html.etree.ParseError, html.etree.ParserError) as parsing_error:
-                self.display.error(parsing_error)
-                self.display.exit(
-                    "Login: your login went wrong and it encountered in an error"
-                    " trying to parse the login details of Safari Books Online. Try again..."
-                )
+                error = response.json()
+                detail = error.get("detail") or error.get("message") or str(error)
+            except Exception:
+                detail = response.text[:200]
+            self.display.exit("Login: failed — %s" % detail)
 
-        self.jwt = response.json()  # TODO: save JWT Tokens and use the refresh_token to restore user session
-        response = self.requests_provider(self.jwt["redirect_uri"])
-        if response == 0:
-            self.display.exit("Login: unable to reach Safari Books Online. Try again...")
+        data = response.json()
+        if not data.get("logged_in"):
+            self.display.exit("Login: server returned logged_in=false. Check your credentials.")
+
+        # Cookies (orm-jwt, orm-rt) are set via Set-Cookie headers on api.oreilly.com.
+        # Explicitly mirror them onto the session for learning.oreilly.com requests.
+        self.session.cookies.set("orm-jwt", data["id_token"], domain=".oreilly.com")
+        self.session.cookies.set("orm-rt", data["refresh_token"], domain=".oreilly.com")
 
     def check_login(self):
         response = self.requests_provider(PROFILE_URL, perform_redirect=False)
@@ -582,7 +561,40 @@ class SafariBooks:
         if response == 0:
             self.display.exit("API: unable to retrieve book info.")
 
-        response = response.json()
+        if response.status_code in (401, 403):
+            self.display.exit(
+                "API: authentication failed (HTTP %d) — your cookies may have expired. "
+                "Please refresh them via the Cookie screen." % response.status_code
+            )
+
+        if response.status_code == 404:
+            self.display.info("v1 API returned 404, trying v2 API...")
+            self.api_v2 = True
+            self.api_url = API_V2_TEMPLATE.format(self.book_id)
+            response = self.requests_provider(self.api_url)
+            if response == 0:
+                self.display.exit("API: unable to retrieve book info (v1 and v2 both failed).")
+            if response.status_code != 200:
+                self.display.exit(
+                    "API: v2 also returned HTTP %d for book info." % response.status_code
+                )
+
+        elif response.status_code != 200:
+            self.display.exit("API: unexpected status %d retrieving book info." % response.status_code)
+
+        try:
+            response = response.json()
+        except ValueError:
+            snippet = response.text[:200].replace("\n", " ")
+            self.display.exit(
+                "API: response was not valid JSON (HTTP %d, %d bytes): %r" % (
+                    response.status_code, len(response.content), snippet
+                )
+            )
+
+        if self.api_v2:
+            return self._normalize_v2_book_info(response)
+
         if not isinstance(response, dict) or len(response.keys()) == 1:
             self.display.exit(self.display.api_error(response))
 
@@ -595,12 +607,88 @@ class SafariBooks:
 
         return response
 
-    def get_book_chapters(self, page=1):
-        response = self.requests_provider(urljoin(self.api_url, "chapter/?page=%s" % page))
+    def _normalize_v2_book_info(self, v2: dict) -> dict:
+        """Map a v2 book info response to the v1-compatible dict shape."""
+        files_base = (
+            "https://" + SAFARI_BASE_HOST
+            + "/api/v2/epubs/urn:orm:book:" + self.book_id + "/files/"
+        )
+        return {
+            "title": v2.get("title", "n/a"),
+            "isbn": v2.get("isbn", ""),
+            "identifier": v2.get("identifier", ""),
+            "issued": v2.get("publication_date", "n/a"),
+            "description": v2.get("descriptions", {}).get("text/plain", ""),
+            "web_url": files_base,
+            "authors": [],
+            "publishers": [],
+            "rights": "n/a",
+            "subjects": [{"name": t} for t in v2.get("tags", [])],
+        }
+
+    def _normalize_v2_chapter(self, v2_ch: dict) -> dict:
+        """Map a v2 epub-chapter object to the v1-compatible dict shape."""
+        files_base = (
+            "https://" + SAFARI_BASE_HOST
+            + "/api/v2/epubs/urn:orm:book:" + self.book_id + "/files"
+        )
+        assets = v2_ch.get("related_assets", {})
+        images = [
+            img.split("/files/")[-1]
+            for img in assets.get("images", [])
+            if "/files/" in img
+        ]
+        stylesheets = [{"url": s} for s in assets.get("stylesheets", [])]
+        return {
+            "title": v2_ch.get("title", ""),
+            "filename": v2_ch["content_url"].split("/")[-1],
+            "content": v2_ch["content_url"],
+            "asset_base_url": files_base,
+            "images": images,
+            "stylesheets": stylesheets,
+        }
+
+    @staticmethod
+    def _normalize_v2_toc_entry(entry: dict) -> dict:
+        """Map a v2 table-of-contents entry to the v1-compatible dict shape."""
+        fragment = entry.get("fragment", "")
+        return {
+            "depth": entry["depth"],
+            "fragment": fragment,
+            "id": entry["ourn"].split(":")[-1],
+            "label": entry["title"],
+            "href": entry["reference_id"].split("-/")[-1],
+            "children": [
+                SafariBooks._normalize_v2_toc_entry(c)
+                for c in entry.get("children", [])
+            ],
+        }
+
+    def get_book_chapters(self, page=1, _v2_next_url=None):
+        if self.api_v2:
+            url = _v2_next_url or API_V2_CHAPTERS_TEMPLATE.format(self.book_id)
+        else:
+            url = urljoin(self.api_url, "chapter/?page=%s" % page)
+
+        response = self.requests_provider(url)
         if response == 0:
             self.display.exit("API: unable to retrieve book chapters.")
 
-        response = response.json()
+        if response.status_code not in (200, 201):
+            self.display.exit(
+                "API: unexpected status %d retrieving chapters — "
+                "cookies may be expired." % response.status_code
+            )
+
+        try:
+            response = response.json()
+        except ValueError:
+            snippet = response.text[:200].replace("\n", " ")
+            self.display.exit(
+                "API: chapter list response was not valid JSON (HTTP %d, %d bytes): %r" % (
+                    response.status_code, len(response.content), snippet
+                )
+            )
 
         if not isinstance(response, dict) or len(response.keys()) == 1:
             self.display.exit(self.display.api_error(response))
@@ -611,13 +699,23 @@ class SafariBooks:
         if response["count"] > sys.getrecursionlimit():
             sys.setrecursionlimit(response["count"])
 
-        result = []
-        result.extend([c for c in response["results"] if "cover" in c["filename"] or "cover" in c["title"]])
-        for c in result:
-            del response["results"][response["results"].index(c)]
+        if self.api_v2:
+            chapters = [self._normalize_v2_chapter(ch) for ch in response["results"]]
+        else:
+            chapters = response["results"]
 
-        result += response["results"]
-        return result + (self.get_book_chapters(page + 1) if response["next"] else [])
+        result = []
+        result.extend([c for c in chapters if "cover" in c["filename"] or "cover" in c["title"]])
+        for c in result:
+            del chapters[chapters.index(c)]
+        result += chapters
+
+        if response["next"]:
+            if self.api_v2:
+                return result + self.get_book_chapters(_v2_next_url=response["next"])
+            else:
+                return result + self.get_book_chapters(page + 1)
+        return result
 
     def get_default_cover(self):
         response = self.requests_provider(self.book_info["cover"], stream=True)
@@ -1051,15 +1149,26 @@ class SafariBooks:
         return r, c, mx
 
     def create_toc(self):
-        response = self.requests_provider(urljoin(self.api_url, "toc/"))
+        if self.api_v2:
+            toc_url = urljoin(self.api_url, "table-of-contents/")
+        else:
+            toc_url = urljoin(self.api_url, "toc/")
+
+        response = self.requests_provider(toc_url)
         if response == 0:
-            self.display.exit("API: unable to retrieve book chapters. "
+            self.display.exit("API: unable to retrieve book TOC. "
                               "Don't delete any files, just run again this program"
                               " in order to complete the `.epub` creation!")
 
         response = response.json()
 
-        if not isinstance(response, list) and len(response.keys()) == 1:
+        if self.api_v2:
+            if not isinstance(response, list):
+                self.display.exit(self.display.api_error(response) +
+                                  " Don't delete any files, just run again this program"
+                                  " in order to complete the `.epub` creation!")
+            response = [self._normalize_v2_toc_entry(e) for e in response]
+        elif not isinstance(response, list) and len(response.keys()) == 1:
             self.display.exit(
                 self.display.api_error(response) +
                 " Don't delete any files, just run again this program"
@@ -1140,15 +1249,18 @@ if __name__ == "__main__":
     )
 
     args_parsed = arguments.parse_args()
-    if args_parsed.cred or args_parsed.login:
-        print(
-            "WARNING: Due to recent changes on the O'Reilly website,\n"
-            "the `--cred` and `--login` options are temporarily disabled.\n"
-            "    Please use the `cookies.json` file to authenticate your account.\n"
-            "    Run `python retrieve_cookies.py` or use the TUI (`python tui.py`).\n"
-            "    See: https://github.com/lorenzodifuccia/safaribooks/issues/358"
-        )
-        arguments.exit()
+
+    if args_parsed.login:
+        email = input("Email: ").strip()
+        password = getpass.getpass("Password: ")
+        args_parsed.cred = [email, password]
+
+    elif args_parsed.cred:
+        args_parsed.cred = SafariBooks.parse_cred(args_parsed.cred)
+        if not args_parsed.cred:
+            arguments.error(
+                "invalid --cred value; expected format: \"account@mail.com:password\""
+            )
 
     SafariBooks(args_parsed)
     sys.exit(0)
