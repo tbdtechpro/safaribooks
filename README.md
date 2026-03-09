@@ -1,179 +1,322 @@
-# SafariBooks
-Download and generate *EPUB* of your favorite books from [*Safari Books Online*](https://www.safaribooksonline.com) library.  
-I'm not responsible for the use of this program, this is only for *personal* and *educational* purpose.  
-Before any usage please read the *O'Reilly*'s [Terms of Service](https://learning.oreilly.com/terms/).  
+# SafariBooks (tbdtechpro fork)
 
-<a href='https://ko-fi.com/Y8Y0MPEGU' target='_blank'><img height='80' style='border:0px;height:60px;' src='https://storage.ko-fi.com/cdn/kofi6.png?v=6' border='0' alt='Buy Me a Coffee at ko-fi.com'/></a>
+Download and generate *EPUB* files from your [O'Reilly Learning](https://learning.oreilly.com) library subscription.
 
-## ✨✨ *Attention needed* ✨✨
-- This project is no longer actively maintained.  
-- *Login through `safaribooks` no longer works due to changes in ORLY APIs.*
-- *The program needs a major refactor to include new features and integrate new APIs.*
-- **However... it still work for downloading books.**  
-(Use SSO hack: log in via browser, then copy cookies into `cookies.json`, see below and issues. Love ❤️)
+> **Note:** This is a maintained fork of [lorenzodifuccia/safaribooks](https://github.com/lorenzodifuccia/safaribooks).
+> Credit and thanks to Lorenzo Di Fuccia for the original implementation.
+> This fork adds email/password login, a v2 API fallback, an interactive TUI, and several export features.
+
+*For personal and educational use only. Please read the O'Reilly [Terms of Service](https://learning.oreilly.com/terms/) before use.*
 
 ---
 
-## Overview:
-  * [Requirements & Setup](#requirements--setup)
-  * [Usage](#usage)
-  * [Single Sign-On (SSO), Company, University Login](https://github.com/lorenzodifuccia/safaribooks/issues/150#issuecomment-555423085)
-  * [Calibre EPUB conversion](https://github.com/lorenzodifuccia/safaribooks#calibre-epub-conversion)
-  * [Example: Download *Test-Driven Development with Python, 2nd Edition*](#download-test-driven-development-with-python-2nd-edition)
-  * [Example: Use or not the `--kindle` option](#use-or-not-the---kindle-option)
+## Overview
 
-## Requirements & Setup:
-First of all, it requires `python3` and `pip3` or `pipenv` to be installed.  
-```shell
-$ git clone https://github.com/lorenzodifuccia/safaribooks.git
-Cloning into 'safaribooks'...
+- [Requirements & Setup](#requirements--setup)
+- [Authentication](#authentication)
+- [Usage — CLI](#usage--cli)
+- [Usage — Interactive TUI](#usage--interactive-tui)
+- [Export Features](#export-features)
+- [Calibre EPUB Conversion](#calibre-epub-conversion)
+- [Examples](#examples)
 
-$ cd safaribooks/
-$ pip3 install -r requirements.txt
+---
 
-OR
+## Requirements & Setup
 
-$ pipenv install && pipenv shell
-```  
+**Python 3.11+** is required. Run the included setup script to create a virtual environment and install all dependencies:
 
-The program depends of only two **Python _3_** modules:
-```python3
-lxml>=4.1.1
-requests>=2.20.0
-```
-  
-## Usage:
-It's really simple to use, just choose a book from the library and replace in the following command:
-  * X-es with its ID, 
-  * `email:password` with your own. 
-
-```shell
-$ python3 safaribooks.py --cred "account_mail@mail.com:password01" XXXXXXXXXXXXX
+```bash
+git clone https://github.com/tbdtechpro/safaribooks.git
+cd safaribooks/
+chmod +x setup.sh
+./setup.sh
 ```
 
-The ID is the digits that you find in the URL of the book description page:  
-`https://www.safaribooksonline.com/library/view/book-name/XXXXXXXXXXXXX/`  
-Like: `https://www.safaribooksonline.com/library/view/test-driven-development-with/9781491958698/`  
-  
-#### Program options:
-```shell
-$ python3 safaribooks.py --help
+The setup script:
+1. Verifies your platform (targets Ubuntu 24.04, warns on others)
+2. Installs system packages via `apt-get` (Python 3, build tools, Calibre)
+3. Creates a `.venv` virtual environment
+4. Installs Python dependencies (`lxml`, `requests`, `browser_cookie3`, `bubbletea`, `lipgloss`)
+
+After setup, activate the environment:
+
+```bash
+source .venv/bin/activate
+```
+
+**Python dependencies** (see `requirements.txt`):
+```
+lxml>=4.9.0
+requests>=2.28.0
+browser_cookie3
+```
+Plus `bubbletea` and `lipgloss` (tbdtechpro forks) for the TUI.
+
+---
+
+## Authentication
+
+This fork supports two authentication methods:
+
+### Option 1 — Email & Password (recommended)
+
+Pass credentials directly on the command line:
+
+```bash
+python safaribooks.py --cred "account@example.com:MyPassword" BOOKID
+```
+
+Or use `--login` to be prompted interactively (safer — password not visible in shell history):
+
+```bash
+python safaribooks.py --login BOOKID
+```
+
+Session cookies are saved to `cookies.json` automatically. On subsequent runs you can omit credentials until the session expires.
+
+### Option 2 — Cookie from Browser (SSO / company login)
+
+If you authenticate via SSO, Google, or a company portal, log in via your browser, then copy the session cookie string and save it:
+
+```bash
+# From DevTools → Network → any request → Copy "Cookie" header value
+python retrieve_cookies.py --cookie "orm-jwt=eyJ...; orm-rt=..."
+
+# Or paste interactively
+python retrieve_cookies.py --cookie
+```
+
+The TUI also has a dedicated cookie input screen.
+
+```bash
+# Auto-extract from browser (may not work on modern Chrome due to OS encryption)
+python retrieve_cookies.py
+```
+
+> **Security note:** Anyone with access to `cookies.json` can use your session. Use `--no-cookies` if on a shared machine.
+
+---
+
+## Usage — CLI
+
+```bash
+python safaribooks.py [OPTIONS] <BOOK ID>
+```
+
+The Book ID is the number in the O'Reilly URL:
+`https://learning.oreilly.com/library/view/book-name/XXXXXXXXXXXXX/`
+
+### All Options
+
+```
 usage: safaribooks.py [--cred <EMAIL:PASS> | --login] [--no-cookies]
-                      [--kindle] [--preserve-log] [--help]
+                      [--kindle] [--preserve-log]
+                      [--skip-if-downloaded] [--scan-library]
+                      [--export-markdown] [--export-db] [--export-rag]
+                      [--help]
                       <BOOK ID>
 
-Download and generate an EPUB of your favorite books from Safari Books Online.
-
 positional arguments:
-  <BOOK ID>            Book digits ID that you want to download. You can find
-                       it in the URL (X-es):
-                       `https://learning.oreilly.com/library/view/book-
-                       name/XXXXXXXXXXXXX/`
+  <BOOK ID>             Book ID from the O'Reilly URL.
 
-optional arguments:
-  --cred <EMAIL:PASS>  Credentials used to perform the auth login on Safari
-                       Books Online. Es. ` --cred
-                       "account_mail@mail.com:password01" `.
-  --login              Prompt for credentials used to perform the auth login
-                       on Safari Books Online.
-  --no-cookies         Prevent your session data to be saved into
-                       `cookies.json` file.
-  --kindle             Add some CSS rules that block overflow on `table` and
-                       `pre` elements. Use this option if you're going to
-                       export the EPUB to E-Readers like Amazon Kindle.
-  --preserve-log       Leave the `info_XXXXXXXXXXXXX.log` file even if there
-                       isn't any error.
-  --help               Show this help message.
+options:
+  --cred <EMAIL:PASS>   Email and password for login.
+  --login               Prompt for credentials interactively.
+  --no-cookies          Do not save session to cookies.json.
+  --kindle              Add CSS rules for Kindle compatibility
+                        (blocks overflow on table/pre elements).
+  --preserve-log        Keep the info log file even on success.
+  --skip-if-downloaded  Skip download if the book is already in
+                        the local library registry (library.db).
+  --scan-library        Scan existing Books/ directories and
+                        populate library.db, then exit.
+  --export-markdown     Write GFM Markdown to Books/{title}/markdown/.
+  --export-db           Store chapter XHTML and TOC in library.db.
+  --export-rag          Write heading-chunked JSONL to
+                        Books/{title}/rag/{book_id}_rag.jsonl.
+                        Implies --export-db.
+  --help                Show this help message.
 ```
-  
-The first time you use the program, you'll have to specify your Safari Books Online account credentials (look [`here`](/../../issues/15) for special character).  
-The next times you'll download a book, before session expires, you can omit the credential, because the program save your session cookies in a file called `cookies.json`.  
-For **SSO**, please use the `sso_cookies.py` program in order to create the `cookies.json` file from the SSO cookies retrieved by your browser session (please follow [`these steps`](/../../issues/150#issuecomment-555423085)).  
-  
-Pay attention if you use a shared PC, because everyone that has access to your files can steal your session. 
-If you don't want to cache the cookies, just use the `--no-cookies` option and provide all time your credential through the `--cred` option or the more safe `--login` one: this will prompt you for credential during the script execution.
 
-You can configure proxies by setting on your system the environment variable `HTTPS_PROXY` or using the `USE_PROXY` directive into the script.
+---
 
-#### Calibre EPUB conversion
-**Important**: since the script only download HTML pages and create a raw EPUB, many of the CSS and XML/HTML directives are wrong for an E-Reader. To ensure best quality of the output, I suggest you to always convert the `EPUB` obtained by the script to standard-`EPUB` with [Calibre](https://calibre-ebook.com/).
-You can also use the command-line version of Calibre with `ebook-convert`, e.g.:
+## Usage — Interactive TUI
+
+Launch the terminal UI for a menu-driven experience:
+
 ```bash
-$ ebook-convert "XXXX/safaribooks/Books/Test-Driven Development with Python 2nd Edition (9781491958698)/9781491958698.epub" "XXXX/safaribooks/Books/Test-Driven Development with Python 2nd Edition (9781491958698)/9781491958698_CLEAR.epub"
+python tui.py
 ```
-After the execution, you can read the `9781491958698_CLEAR.epub` in every E-Reader and delete all other files.
 
-The program offers also an option to ensure best compatibilities for who wants to export the `EPUB` to E-Readers like Amazon Kindle: `--kindle`, it blocks overflow on `table` and `pre` elements (see [example](#use-or-not-the---kindle-option)).  
-In this case, I suggest you to convert the `EPUB` to `AZW3` with Calibre or to `MOBI`, remember in this case to select `Ignore margins` in the conversion options:  
-  
-![Calibre IgnoreMargins](https://github.com/lorenzodifuccia/cloudflare/raw/master/Images/safaribooks/safaribooks_calibre_IgnoreMargins.png "Select Ignore margins")  
-  
-## Examples:
-  * ## Download [Test-Driven Development with Python, 2nd Edition](https://www.safaribooksonline.com/library/view/test-driven-development-with/9781491958698/):  
-    ```shell
-    $ python3 safaribooks.py --cred "my_email@gmail.com:MyPassword1!" 9781491958698
+The TUI provides:
+- **Login** — email/password login flow
+- **Set Cookie** — paste your browser session cookie
+- **Add Book to Queue** — queue multiple books for batch download
+- **View / Run Queue** — manage the queue with export toggles:
+  - `m` — toggle Markdown export
+  - `d` — toggle Content DB storage
+  - `x` — toggle RAG JSONL export
+  - `k` — toggle skip-if-downloaded
+  - `r` — run all downloads
 
-           ____     ___         _ 
-          / __/__ _/ _/__ _____(_)
-         _\ \/ _ `/ _/ _ `/ __/ / 
-        /___/\_,_/_/ \_,_/_/ /_/  
-          / _ )___  ___  / /__ ___
-         / _  / _ \/ _ \/  '_/(_-<
-        /____/\___/\___/_/\_\/___/
+---
 
-    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-    [-] Logging into Safari Books Online...
-    [*] Retrieving book info... 
-    [-] Title: Test-Driven Development with Python, 2nd Edition                     
-    [-] Authors: Harry J.W. Percival                                                
-    [-] Identifier: 9781491958698                                                   
-    [-] ISBN: 9781491958704                                                         
-    [-] Publishers: O'Reilly Media, Inc.                                            
-    [-] Rights: Copyright © O'Reilly Media, Inc.                                    
-    [-] Description: By taking you through the development of a real web application 
-    from beginning to end, the second edition of this hands-on guide demonstrates the 
-    practical advantages of test-driven development (TDD) with Python. You’ll learn 
-    how to write and run tests before building each part of your app, and then develop
-    the minimum amount of code required to pass those tests. The result? Clean code
-    that works.In the process, you’ll learn the basics of Django, Selenium, Git, 
-    jQuery, and Mock, along with curre...
-    [-] Release Date: 2017-08-18
-    [-] URL: https://learning.oreilly.com/library/view/test-driven-development-with/9781491958698/
-    [*] Retrieving book chapters...                                                 
-    [*] Output directory:                                                           
-        /XXXX/safaribooks/Books/Test-Driven Development with Python 2nd Edition (9781491958698)
-    [-] Downloading book contents... (53 chapters)                                  
-        [#####################################################################] 100%
-    [-] Downloading book CSSs... (2 files)                                          
-        [#####################################################################] 100%
-    [-] Downloading book images... (142 files)                                      
-        [#####################################################################] 100%
-    [-] Creating EPUB file...                                                       
-    [*] Done: /XXXX/safaribooks/Books/Test-Driven Development with Python 2nd Edition 
-    (9781491958698)/9781491958698.epub
-    
-        If you like it, please * this project on GitHub to make it known:
-            https://github.com/lorenzodifuccia/safaribooks
-        e don't forget to renew your Safari Books Online subscription:
-            https://learning.oreilly.com
-    
-    [!] Bye!!
-    ```  
-     The result will be (opening the `EPUB` file with Calibre):  
+## Export Features
 
-    ![Book Appearance](https://github.com/lorenzodifuccia/cloudflare/raw/master/Images/safaribooks/safaribooks_example01_TDD.png "Book opened with Calibre")  
- 
-  * ## Use or not the `--kindle` option:
-    ```bash
-    $ python3 safaribooks.py --kindle 9781491958698
-    ```  
-    On the right, the book created with `--kindle` option, on the left without (default):  
-    
-    ![NoKindle Option](https://github.com/lorenzodifuccia/cloudflare/raw/master/Images/safaribooks/safaribooks_example02_NoKindle.png "Version compare")  
-    
----  
-  
-## Thanks!!
-For any kind of problem, please don't hesitate to open an issue here on *GitHub*.  
-  
-*Lorenzo Di Fuccia*
+All outputs land in `Books/{book-title}/` alongside the EPUB.
+
+### Library Registry (`library.db`)
+
+Every download is automatically recorded in `Books/library.db` (SQLite). Fields include title, authors, ISBN, sha256 of the EPUB, chapter count, and API version used.
+
+```bash
+# Populate registry from existing Books/ directories (no network needed)
+python safaribooks.py --scan-library
+
+# Skip re-downloading a book already in the registry
+python safaribooks.py --skip-if-downloaded BOOKID
+
+# Inspect the registry
+sqlite3 Books/library.db "SELECT title, chapter_count, downloaded_at FROM registry"
+```
+
+### Markdown Export (`--export-markdown`)
+
+Converts each chapter's XHTML to [GitHub Flavored Markdown](https://github.github.com/gfm/):
+
+```
+Books/{title}/
+└── markdown/
+    ├── images/       (copied from OEBPS/Images/)
+    ├── ch01.md
+    ├── ch02.md
+    └── _book.md      (all chapters combined)
+```
+
+Handles headings, code blocks, tables, lists, links, images, figures, and O'Reilly-specific `data-type` elements.
+
+### Content DB (`--export-db`)
+
+Stores raw XHTML and converted Markdown for every chapter, plus a flattened TOC, in `library.db`:
+
+```bash
+sqlite3 Books/library.db ".tables"
+# registry  chapters  toc
+
+sqlite3 Books/library.db "SELECT title, markdown_text FROM chapters WHERE book_id='BOOKID' LIMIT 1"
+```
+
+### RAG JSONL Export (`--export-rag`)
+
+Produces a heading-chunked JSONL file for use with retrieval-augmented generation (RAG) pipelines. Each record is a chunk with full provenance:
+
+```json
+{
+  "book_id": "9781098166298",
+  "title": "AI Engineering",
+  "authors": ["Chip Huyen"],
+  "chapter_filename": "ch01.xhtml",
+  "chapter_title": "Introduction",
+  "section_heading": "From Language Models to LLMs",
+  "section_depth": 2,
+  "chunk_index": 0,
+  "text": "...",
+  "approx_tokens": 487,
+  "source_url": "https://learning.oreilly.com/library/view/..."
+}
+```
+
+Output path: `Books/{title}/rag/{book_id}_rag.jsonl`
+
+`--export-rag` implies `--export-db`.
+
+### Full Export Example
+
+```bash
+python safaribooks.py \
+  --cred "account@example.com:password" \
+  --export-markdown \
+  --export-db \
+  --export-rag \
+  9781098166298
+```
+
+---
+
+## Calibre EPUB Conversion
+
+The generated EPUB is a raw extraction. For best E-Reader compatibility, convert with [Calibre](https://calibre-ebook.com/):
+
+```bash
+ebook-convert "Books/My Book (9781234567890)/9781234567890.epub" \
+              "Books/My Book (9781234567890)/9781234567890_clean.epub"
+```
+
+Or use the included helper (converts all EPUBs in your Books directory):
+
+```bash
+python calibre_convert.py Books/*/*.epub
+```
+
+For Kindle, use `--kindle` when downloading, then convert to AZW3 or MOBI:
+
+```bash
+python safaribooks.py --kindle BOOKID
+# Then in Calibre: select "Ignore margins" in conversion options
+```
+
+---
+
+## Examples
+
+### Basic download
+
+```bash
+python safaribooks.py --cred "my@email.com:MyPassword" 9781491958698
+```
+
+Output:
+```
+[-] Logging into O'Reilly...
+[*] Retrieving book info...
+[-] Title: Test-Driven Development with Python, 2nd Edition
+[-] Authors: Harry J.W. Percival
+[-] Identifier: 9781491958698
+[*] Retrieving book chapters...
+[-] Downloading book contents... (53 chapters)
+    [####################################################] 100%
+[-] Downloading book CSSs... (2 files)
+[-] Downloading book images... (142 files)
+[-] Creating EPUB file...
+[*] Done: Books/Test-Driven Development with Python 2nd Edition (9781491958698)/9781491958698.epub
+```
+
+### Skip already-downloaded books
+
+```bash
+python safaribooks.py --cred "my@email.com:MyPassword" --skip-if-downloaded 9781491958698
+# Book already downloaded: Test-Driven Development with Python, 2nd Edition
+# EPUB: Books/Test-Driven Development with Python 2nd Edition (9781491958698)/9781491958698.epub
+```
+
+### Kindle-friendly export
+
+```bash
+python safaribooks.py --kindle 9781491958698
+```
+
+---
+
+## API Version Support
+
+This fork automatically falls back to the O'Reilly v2 API when a book is unavailable on the v1 endpoint. Newer books (published 2024+) often require the v2 API — this is handled transparently with no extra configuration needed.
+
+---
+
+## Credits
+
+- Original project: [lorenzodifuccia/safaribooks](https://github.com/lorenzodifuccia/safaribooks) by Lorenzo Di Fuccia
+- This fork: [tbdtechpro/safaribooks](https://github.com/tbdtechpro/safaribooks)
+
+For issues with this fork, please open an issue on the [tbdtechpro/safaribooks](https://github.com/tbdtechpro/safaribooks/issues) repository.
