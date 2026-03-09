@@ -1605,17 +1605,182 @@ class AppModel(tea.Model):
         worker.start()
 
     def _key_calibre_sync(self, key: str):
+        # Scanning — only Esc
+        if self.sync_scanning:
+            if key == "escape":
+                self.screen = Screen.MAIN
+            return self, None
+
+        # Done — Esc/q to go back
+        if self.sync_all_done:
+            if key in ("escape", "q"):
+                self.screen = Screen.MAIN
+            return self, None
+
+        # Adding in progress — no keys
+        if self.sync_adding:
+            return self, None
+
+        # Error state
+        if self.sync_error:
+            if key == "escape":
+                self.screen = Screen.MAIN
+            return self, None
+
+        # Review phase
+        entries = self.sync_entries
+        total   = len(entries)
+
         if key == "escape":
             self.screen = Screen.MAIN
+            return self, None
+
+        if key in ("up", "k"):
+            self.sync_cursor = max(0, self.sync_cursor - 1)
+            rows_available = max(3, self.height - 8)
+            visible_count  = max(1, rows_available // 2)
+            if self.sync_cursor < self.sync_scroll:
+                self.sync_scroll = self.sync_cursor
+        elif key in ("down", "j"):
+            self.sync_cursor = min(max(0, total - 1), self.sync_cursor + 1)
+            rows_available = max(3, self.height - 8)
+            visible_count  = max(1, rows_available // 2)
+            if self.sync_cursor >= self.sync_scroll + visible_count:
+                self.sync_scroll = self.sync_cursor - visible_count + 1
+        elif key == " ":
+            if 0 <= self.sync_cursor < total:
+                entry = entries[self.sync_cursor]
+                if entry.match == "none":
+                    if entry.book_id in self.sync_selected:
+                        self.sync_selected.discard(entry.book_id)
+                    else:
+                        self.sync_selected.add(entry.book_id)
+        elif key == "a":
+            none_ids = {e.book_id for e in entries if e.match == "none"}
+            if self.sync_selected >= none_ids:
+                self.sync_selected = set()
+            else:
+                self.sync_selected = none_ids.copy()
+        elif key == "r":
+            to_add = [e for e in entries if e.book_id in self.sync_selected]
+            if to_add:
+                self._start_calibre_add(to_add)
+
         return self, None
 
     def _view_calibre_sync(self) -> str:
         lines = [self._header("Sync with Calibre Library"), ""]
-        lines.append("  Scanning…" if self.sync_scanning else "  (not yet implemented)")
+
+        # ── Scanning phase ─────────────────────────────────────────────────────
+        if self.sync_scanning:
+            lines.append("")
+            lines.append(hint_style.render("  Scanning library and calibredb…"))
+            lines.append("")
+            lines.append(self._footer("Esc  cancel"))
+            return panel_style.width(min(self.width - 4, 72)).render("\n".join(lines))
+
+        # ── Error state ────────────────────────────────────────────────────────
+        if self.sync_error:
+            lines.append(error_style.render(f"  ✗ {self.sync_error}"))
+            lines.append("")
+            lines.append(self._footer("Esc  back"))
+            return panel_style.width(min(self.width - 4, 72)).render("\n".join(lines))
+
+        # ── Adding / done phase ────────────────────────────────────────────────
+        if self.sync_adding or self.sync_all_done:
+            return self._view_calibre_sync_adding()
+
+        # ── Review phase ───────────────────────────────────────────────────────
+        entries   = self.sync_entries
+        unsynced  = [e for e in entries if e.match == "none"]
+        ambiguous = [e for e in entries if e.match == "ambiguous"]
+        selected  = len([e for e in unsynced if e.book_id in self.sync_selected])
+
+        summary = (
+            f"  {len(unsynced)} not in library  "
+            f"({self.sync_already_synced} synced"
+            + (f" · {len(ambiguous)} ambiguous" if ambiguous else "")
+            + (f" · {self.sync_skipped} skipped" if self.sync_skipped else "")
+            + ")"
+        )
+        lines.append(accent_style.render(summary))
+        lines.append(hint_style.render(f"  {selected} selected for import"))
         lines.append("")
-        lines.append(self._footer("Esc  back"))
-        content = "\n".join(lines)
-        return panel_style.width(min(self.width - 4, 72)).render(content)
+
+        if not entries:
+            lines.append(success_style.render("  ✓ All local books are already in your Calibre library!"))
+            lines.append("")
+            lines.append(self._footer("Esc  back"))
+            return panel_style.width(min(self.width - 4, 72)).render("\n".join(lines))
+
+        rows_available = max(3, self.height - 8)
+        visible_count  = max(1, rows_available // 2)
+        total          = len(entries)
+        self.sync_scroll = max(0, min(self.sync_scroll, max(0, total - visible_count)))
+        visible = entries[self.sync_scroll: self.sync_scroll + visible_count]
+
+        for i, entry in enumerate(visible):
+            abs_idx  = self.sync_scroll + i
+            focused  = abs_idx == self.sync_cursor
+            checked  = entry.book_id in self.sync_selected
+            is_ambig = entry.match == "ambiguous"
+
+            if is_ambig:
+                box  = hint_style.render("[~]")
+                body = hint_style.render(f"  {entry.title[:42]}  ~ possible match")
+            else:
+                box  = accent_style.render("[✓]") if checked else "[ ]"
+                body = f"  {entry.title[:42]}"
+                if entry.author:
+                    body += hint_style.render(f" — {entry.author[:28]}")
+
+            prefix = "▶ " if focused else "  "
+            row = f"{prefix}{box}{body}"
+            if focused:
+                lines.append(cursor_style.render(row))
+            else:
+                lines.append(row)
+            lines.append("")
+
+        if total > visible_count:
+            end = min(self.sync_scroll + visible_count, total)
+            lines.append(hint_style.render(
+                f"  Showing {self.sync_scroll + 1}–{end} of {total}   ↑/↓ to scroll"
+            ))
+            lines.append("")
+
+        lines.append(self._footer("↑/↓  move    Space  toggle    a  all    r  add selected    Esc  back"))
+        return panel_style.width(min(self.width - 4, 72)).render("\n".join(lines))
+
+    def _view_calibre_sync_adding(self) -> str:
+        lines = [self._header("Adding to Calibre Library"), ""]
+
+        for book_id, status in self.sync_add_status.items():
+            entry = next((e for e in self.sync_entries if e.book_id == book_id), None)
+            label = entry.title[:40] if entry else book_id
+            if status == "adding":
+                st = Style().foreground(C_YELLOW).render("⟳ Adding…")
+            elif status == "done":
+                st = success_style.render("✓ Added")
+            elif status.startswith("error:"):
+                st = error_style.render("✗ " + status[6:50])
+            else:
+                st = hint_style.render(status)
+            lines.append(f"  {label}")
+            lines.append(f"  {st}")
+            lines.append("")
+
+        if self.sync_all_done:
+            lines.append(success_style.render("  All done!"))
+            lines.append("")
+            lines.append(self._footer("Esc  back to menu    q  quit"))
+        else:
+            lines.append(self._footer("Running…"))
+
+        return panel_style.width(min(self.width - 4, 72)).render("\n".join(lines))
+
+    def _start_calibre_add(self, entries: list):
+        pass  # implemented in Task 5
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
