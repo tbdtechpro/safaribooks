@@ -36,6 +36,7 @@ API_ORIGIN_URL = "https://" + API_ORIGIN_HOST
 PROFILE_URL = SAFARI_BASE_URL + "/profile/"
 API_V2_TEMPLATE = "https://" + SAFARI_BASE_HOST + "/api/v2/epubs/urn:orm:book:{0}/"
 API_V2_CHAPTERS_TEMPLATE = "https://" + SAFARI_BASE_HOST + "/api/v2/epub-chapters/?epub_identifier=urn:orm:book:{0}"
+LOGIN_ENTRY_URL = SAFARI_BASE_URL + "/login/"
 
 # DEBUG
 USE_PROXY = False
@@ -458,6 +459,10 @@ class SafariBooks:
 
         self.epub_path = os.path.join(self.BOOK_PATH, self.book_id + ".epub")
         self.display.done(self.epub_path)
+
+        if not self.display.in_error:
+            self._post_download_exports()
+
         self.display.unregister()
 
         if not self.display.in_error and not args.log:
@@ -1175,6 +1180,7 @@ class SafariBooks:
                 " in order to complete the `.epub` creation!"
             )
 
+        self._toc_data = response
         navmap, _, max_depth = self.parse_toc(response)
         return self.TOC_NCX.format(
             (self.book_info["isbn"] if self.book_info["isbn"] else self.book_id),
@@ -1207,6 +1213,82 @@ class SafariBooks:
 
         shutil.make_archive(zip_file, 'zip', self.BOOK_PATH)
         os.rename(zip_file + ".zip", os.path.join(self.BOOK_PATH, self.book_id) + ".epub")
+
+    def _post_download_exports(self):
+        """Run optional post-download exports based on CLI flags."""
+        args = self.args
+        books_dir = os.path.join(PATH, "Books")
+        db_path = os.path.join(books_dir, "library.db")
+
+        do_registry = True  # always record downloads
+        do_markdown = getattr(args, "export_markdown", False)
+        do_db = getattr(args, "export_db", False)
+        do_rag = getattr(args, "export_rag", False)
+
+        # RAG implies content DB
+        if do_rag:
+            do_db = True
+
+        api_version = "v2" if self.api_v2 else "v1"
+
+        from library import BookRegistry
+        reg = BookRegistry(db_path)
+
+        # Always record the download
+        reg.record_download(
+            book_info=self.book_info,
+            epub_path=self.epub_path,
+            book_dir=self.BOOK_PATH,
+            chapters=self.book_chapters,
+            api_version=api_version,
+        )
+        self.display.info("Registry: download recorded in library.db")
+
+        # Feature 2 — Markdown export
+        markdown_map = None
+        if do_markdown:
+            from exporters import MarkdownExporter
+            self.display.info("Exporting Markdown...", state=True)
+            exporter = MarkdownExporter(
+                book_id=self.book_id,
+                book_path=self.BOOK_PATH,
+                book_info=self.book_info,
+                chapters=self.book_chapters,
+            )
+            markdown_map = exporter.export()
+            self.display.info("Markdown export complete: %s/markdown/" % self.BOOK_PATH)
+
+        # Feature 3 — Content DB
+        if do_db:
+            reg.store_chapters(
+                book_id=self.book_id,
+                chapters=self.book_chapters,
+                book_path=self.BOOK_PATH,
+                markdown_map=markdown_map,
+            )
+            toc_data = getattr(self, "_toc_data", None)
+            if toc_data:
+                reg.store_toc(self.book_id, toc_data)
+            self.display.info("Content DB: chapters/TOC stored in library.db")
+
+        # Feature 4 — RAG JSONL export
+        if do_rag:
+            from exporters import RagExporter
+            rag_dir = os.path.join(self.BOOK_PATH, "rag")
+            os.makedirs(rag_dir, exist_ok=True)
+            output_path = os.path.join(rag_dir, self.book_id + "_rag.jsonl")
+            self.display.info("Exporting RAG JSONL...", state=True)
+            exporter = RagExporter(
+                book_id=self.book_id,
+                book_info=self.book_info,
+                chapters=self.book_chapters,
+                book_path=self.BOOK_PATH,
+                markdown_map=markdown_map,
+            )
+            exporter.export(output_path)
+            self.display.info("RAG export complete: %s" % output_path)
+
+        reg.close()
 
 
 # MAIN
@@ -1242,13 +1324,55 @@ if __name__ == "__main__":
                                                                 " file even if there isn't any error."
     )
     arguments.add_argument("--help", action="help", default=argparse.SUPPRESS, help='Show this help message.')
+
+    # --- Library / export flags ---
     arguments.add_argument(
-        "bookid", metavar='<BOOK ID>',
+        "--skip-if-downloaded", dest="skip_if_downloaded", action='store_true',
+        help="Skip download if the book is already recorded in the local library registry."
+    )
+    arguments.add_argument(
+        "--scan-library", dest="scan_library", action='store_true',
+        help="Scan existing Books/ directories and populate library.db, then exit."
+    )
+    arguments.add_argument(
+        "--export-markdown", dest="export_markdown", action='store_true',
+        help="Write a GFM Markdown version of the book into Books/{title}/markdown/."
+    )
+    arguments.add_argument(
+        "--export-db", dest="export_db", action='store_true',
+        help="Store chapter XHTML and TOC data in Books/library.db."
+    )
+    arguments.add_argument(
+        "--export-rag", dest="export_rag", action='store_true',
+        help="Write heading-chunked JSONL to Books/{title}/rag/{book_id}_rag.jsonl."
+             " Implies --export-db."
+    )
+
+    arguments.add_argument(
+        "bookid", metavar='<BOOK ID>', nargs='?', default=None,
         help="Book digits ID that you want to download. You can find it in the URL (X-es):"
              " `" + SAFARI_BASE_URL + "/library/view/book-name/XXXXXXXXXXXXX/`"
     )
 
     args_parsed = arguments.parse_args()
+
+    # --scan-library: no auth needed, scan and exit
+    if args_parsed.scan_library:
+        import os as _os
+        from library import BookRegistry
+        books_dir = _os.path.join(PATH, "Books")
+        db_path = _os.path.join(books_dir, "library.db")
+        if not _os.path.isdir(books_dir):
+            print("Books/ directory not found. Nothing to scan.")
+            sys.exit(0)
+        reg = BookRegistry(db_path)
+        n = reg.scan_existing_books(books_dir)
+        reg.close()
+        print("Scan complete. %d book(s) added to library.db." % n)
+        sys.exit(0)
+
+    if args_parsed.bookid is None:
+        arguments.error("the following arguments are required: <BOOK ID>")
 
     if args_parsed.login:
         email = input("Email: ").strip()
@@ -1261,6 +1385,23 @@ if __name__ == "__main__":
             arguments.error(
                 "invalid --cred value; expected format: \"account@mail.com:password\""
             )
+
+    # --skip-if-downloaded: check registry before auth/network
+    if args_parsed.skip_if_downloaded:
+        import os as _os
+        from library import BookRegistry
+        books_dir = _os.path.join(PATH, "Books")
+        db_path = _os.path.join(books_dir, "library.db")
+        if _os.path.isdir(books_dir):
+            reg = BookRegistry(db_path)
+            if reg.is_downloaded(args_parsed.bookid):
+                title = reg.get_title(args_parsed.bookid)
+                epub = reg.get_epub_path(args_parsed.bookid)
+                reg.close()
+                print("Book already downloaded: %s" % (title or args_parsed.bookid))
+                print("EPUB: %s" % epub)
+                sys.exit(0)
+            reg.close()
 
     SafariBooks(args_parsed)
     sys.exit(0)

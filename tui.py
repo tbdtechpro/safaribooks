@@ -175,10 +175,16 @@ def render_bar(percent: float, width: int = 28) -> str:
 class DownloadWorker:
     """Runs book downloads sequentially in a background thread."""
 
-    def __init__(self, book_ids: List[str], program: tea.Program, kindle: bool = False):
+    def __init__(self, book_ids: List[str], program: tea.Program, kindle: bool = False,
+                 export_markdown: bool = False, export_db: bool = False,
+                 export_rag: bool = False, skip_if_downloaded: bool = False):
         self.book_ids = book_ids
         self.program = program
         self.kindle = kindle
+        self.export_markdown = export_markdown
+        self.export_db = export_db
+        self.export_rag = export_rag
+        self.skip_if_downloaded = skip_if_downloaded
         self._thread = threading.Thread(target=self._run, daemon=True)
 
     def start(self):
@@ -195,6 +201,11 @@ class DownloadWorker:
                     no_cookies=False,
                     kindle=self.kindle,
                     log=False,
+                    export_markdown=self.export_markdown,
+                    export_db=self.export_db,
+                    export_rag=self.export_rag,
+                    skip_if_downloaded=self.skip_if_downloaded,
+                    scan_library=False,
                 )
 
                 def cb(stage: str, percent: float, _id=book_id):
@@ -299,6 +310,12 @@ class AppModel(tea.Model):
 
         # queue
         self.queue: List[str] = []
+
+        # export toggles
+        self.export_markdown: bool = False
+        self.export_db: bool = False
+        self.export_rag: bool = False
+        self.skip_if_downloaded: bool = False
 
         # download / calibre state
         self.books: dict[str, BookState] = {}   # book_id -> BookState
@@ -522,6 +539,14 @@ class AppModel(tea.Model):
         elif key in ("c", "C"):
             # clear queue
             self.queue.clear()
+        elif key in ("m", "M"):
+            self.export_markdown = not self.export_markdown
+        elif key in ("d", "D"):
+            self.export_db = not self.export_db
+        elif key in ("x", "X"):
+            self.export_rag = not self.export_rag
+        elif key in ("k", "K"):
+            self.skip_if_downloaded = not self.skip_if_downloaded
         return self, None
 
     def _key_download(self, key: str):
@@ -681,7 +706,13 @@ class AppModel(tea.Model):
         self.queue.clear()
 
         self.screen = Screen.DOWNLOAD
-        worker = DownloadWorker(self.dl_order, self._program)
+        worker = DownloadWorker(
+            self.dl_order, self._program,
+            export_markdown=self.export_markdown,
+            export_db=self.export_db,
+            export_rag=self.export_rag,
+            skip_if_downloaded=self.skip_if_downloaded,
+        )
         worker.start()
 
     def _start_calibre(self):
@@ -981,7 +1012,20 @@ class AppModel(tea.Model):
             lines.append(error_style.render("  " + self.status_msg))
             lines.append("")
 
-        lines.append(self._footer("a  add    r  run    s  set cookie    c  clear    Esc  back"))
+        # Export toggles
+        def _toggle(label: str, value: bool) -> str:
+            marker = success_style.render("✓") if value else hint_style.render("○")
+            return f"  {marker} {label}"
+
+        lines.append(_toggle("[m] Markdown export", self.export_markdown))
+        lines.append(_toggle("[d] Content DB",      self.export_db))
+        lines.append(_toggle("[x] RAG JSONL",       self.export_rag))
+        lines.append(_toggle("[k] Skip if downloaded", self.skip_if_downloaded))
+        lines.append("")
+
+        lines.append(self._footer(
+            "a  add    r  run    s  set cookie    c  clear    m/d/x/k  toggles    Esc  back"
+        ))
         content = "\n".join(lines)
         return panel_style.width(min(self.width - 4, 60)).render(content)
 
