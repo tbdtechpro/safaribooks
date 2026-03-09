@@ -45,6 +45,21 @@ def test_parse_nested_arrays_in_object():
     assert len(result) == 1
     assert result[0]["title"] == "Tagged Book"
 
+TRAILING_JUNK = '[{"id":1,"title":"Tagged Book","authors":"Some Author","identifiers":{"isbn":"9780001234567"}}]Integration status: True\n'
+
+def test_parse_ignores_trailing_status_line():
+    """Real calibredb output appends 'Integration status: True' after the array."""
+    result = parse_calibredb_output(TRAILING_JUNK)
+    assert len(result) == 1
+    assert result[0]["title"] == "Tagged Book"
+
+NESTED_WITH_TRAILING = '[{"id":1,"title":"Tagged Book","authors":"A","identifiers":{},"tags":["python","web"]}]Integration status: True\n'
+
+def test_parse_nested_arrays_with_trailing_junk():
+    result = parse_calibredb_output(NESTED_WITH_TRAILING)
+    assert len(result) == 1
+    assert result[0]["title"] == "Tagged Book"
+
 LOCAL_BOOKS = [
     {"book_id": "111", "title": "Clean Code", "authors": [{"name": "Robert C. Martin"}],
      "isbn": "9780132350884", "epub_path": "/books/111/book.epub"},

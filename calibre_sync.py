@@ -33,35 +33,38 @@ def normalize_for_match(text: str) -> str:
 
 
 def parse_calibredb_output(raw: str) -> list:
-    """Parse calibredb --for-machine output, which may be multiple JSON arrays concatenated."""
+    """Parse calibredb --for-machine output.
+
+    Handles:
+    - Single JSON array
+    - Multiple JSON arrays separated by newlines
+    - Trailing non-JSON text (e.g. "Integration status: True" appended by calibredb)
+    """
     if not raw.strip():
         return []
-    # calibredb sometimes outputs multiple JSON arrays separated by newlines.
-    # Split on the boundary between them: "]\n[" or "]\r\n["
-    # Then reconstruct each chunk as a valid JSON array and parse it.
-    raw = raw.strip()
+
+    decoder = json.JSONDecoder()
     results = []
-    # Try parsing the whole thing as one JSON value first
-    try:
-        data = json.loads(raw)
-        if isinstance(data, list):
-            return data
-    except json.JSONDecodeError:
-        pass
-    # Split on array boundaries and parse each chunk
-    chunks = re.split(r'\]\s*\n\s*\[', raw)
-    for i, chunk in enumerate(chunks):
-        # Re-add the stripped brackets
-        if not chunk.startswith('['):
-            chunk = '[' + chunk
-        if not chunk.endswith(']'):
-            chunk = chunk + ']'
+    text = raw.strip()
+    pos = 0
+
+    while pos < len(text):
+        # Skip whitespace
+        while pos < len(text) and text[pos].isspace():
+            pos += 1
+        if pos >= len(text):
+            break
+        if text[pos] != '[':
+            # Non-JSON content (e.g. "Integration status: True") — stop
+            break
         try:
-            data = json.loads(chunk)
-            if isinstance(data, list):
-                results.extend(data)
+            obj, end_pos = decoder.raw_decode(text, pos)
+            if isinstance(obj, list):
+                results.extend(obj)
+            pos = end_pos
         except json.JSONDecodeError:
-            continue
+            break
+
     return results
 
 
