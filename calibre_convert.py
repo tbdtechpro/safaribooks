@@ -63,7 +63,6 @@ def convert_epub(
         str(in_path),
         output_path,
         "--no-default-epub-cover",
-        "--pretty-print-html",
     ]
     if extra_args:
         cmd.extend(extra_args)

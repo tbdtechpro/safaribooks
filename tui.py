@@ -13,6 +13,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Callable, List, Optional, Tuple
@@ -32,6 +33,7 @@ from lipgloss import (
 )
 
 from safaribooks import COOKIES_FILE, SafariBooks, SafariBooksError
+from retrieve_cookies import parse_cookie_string, get_oreilly_cookies_from_browser, login_with_credentials
 
 # ── Colours ──────────────────────────────────────────────────────────────────
 
@@ -73,6 +75,7 @@ cursor_style = Style().foreground(C_SELECTED).bold(True)
 
 class Screen(Enum):
     MAIN       = auto()
+    LOGIN      = auto()
     COOKIE     = auto()
     ADD_BOOK   = auto()
     QUEUE      = auto()
@@ -117,6 +120,23 @@ class CalibreMsg(tea.Msg):
 @dataclass
 class AllCalibreDoneMsg(tea.Msg):
     pass
+
+
+@dataclass
+class LoginResultMsg(tea.Msg):
+    cookies: dict
+    error: str = ""
+
+
+@dataclass
+class BrowserCookieMsg(tea.Msg):
+    cookies: dict
+    error: str = ""
+
+
+@dataclass
+class ClipboardMsg(tea.Msg):
+    text: str
 
 
 # ── Download state per book ───────────────────────────────────────────────────
@@ -220,7 +240,6 @@ class CalibreWorker:
                         book.epub_path,
                         out_path,
                         "--no-default-epub-cover",
-                        "--pretty-print-html",
                     ],
                     capture_output=True,
                     text=True,
@@ -229,7 +248,8 @@ class CalibreWorker:
                 if result.returncode == 0:
                     self.program.send(CalibreMsg(book.book_id, "done", out_path))
                 else:
-                    self.program.send(CalibreMsg(book.book_id, "error", result.stderr.strip()[:200]))
+                    err = (result.stderr or result.stdout or "unknown error").strip()
+                    self.program.send(CalibreMsg(book.book_id, "error", err[:200]))
             except FileNotFoundError:
                 self.program.send(CalibreMsg(book.book_id, "error", "`ebook-convert` not found — is Calibre installed?"))
             except subprocess.TimeoutExpired:
@@ -245,10 +265,11 @@ class CalibreWorker:
 class AppModel(tea.Model):
 
     MENU_ITEMS = [
-        ("Set Session Cookie",   Screen.COOKIE),
-        ("Add Book to Queue",    Screen.ADD_BOOK),
-        ("View / Run Queue",     Screen.QUEUE),
-        ("Quit",                 None),
+        ("Login with Email/Password", Screen.LOGIN),
+        ("Set Session Cookie",        Screen.COOKIE),
+        ("Add Book to Queue",         Screen.ADD_BOOK),
+        ("View / Run Queue",          Screen.QUEUE),
+        ("Quit",                      None),
     ]
 
     def __init__(self):
@@ -259,10 +280,18 @@ class AppModel(tea.Model):
         # main menu
         self.menu_cursor: int = 0
 
+        # login screen
+        self.login_email: str = ""
+        self.login_password: str = ""
+        self.login_field: int = 0          # 0 = email, 1 = password
+        self.login_status: str = ""
+        self.login_running: bool = False
+
         # cookie screen
         self.cookie_input: str = ""
         self.cookie_saved: bool = os.path.isfile(COOKIES_FILE)
         self.cookie_status: str = ""
+        self.cookie_retrieving: bool = False
 
         # add-book screen
         self.book_id_input: str = ""
@@ -296,8 +325,15 @@ class AppModel(tea.Model):
             return self._handle_key(msg.key)
 
         if isinstance(msg, tea.PasteMsg):
-            if self.screen == Screen.COOKIE:
+            if self.screen == Screen.LOGIN:
+                if self.login_field == 0:
+                    self.login_email = msg.text.strip()
+                else:
+                    self.login_password = msg.text.strip()
+            elif self.screen == Screen.COOKIE:
                 self.cookie_input = msg.text.strip()
+            elif self.screen == Screen.ADD_BOOK:
+                self.book_id_input = msg.text.strip()
             return self, None
 
         if isinstance(msg, ProgressMsg):
@@ -324,6 +360,45 @@ class AppModel(tea.Model):
             self.all_calibre_done = True
             return self, None
 
+        if isinstance(msg, LoginResultMsg):
+            self.login_running = False
+            if msg.cookies:
+                with open(COOKIES_FILE, "w") as f:
+                    json.dump(msg.cookies, f)
+                self.cookie_saved = True
+                self.login_status = "ok:Logged in and cookies saved."
+            else:
+                self.login_status = f"error:{msg.error or 'Login failed — check your credentials.'}"
+            return self, None
+
+        if isinstance(msg, BrowserCookieMsg):
+            self.cookie_retrieving = False
+            if msg.cookies:
+                with open(COOKIES_FILE, "w") as f:
+                    json.dump(msg.cookies, f)
+                self.cookie_saved = True
+                self.cookie_status = f"ok:Saved {len(msg.cookies)} cookies from browser."
+            else:
+                self.cookie_status = (
+                    f"error:{msg.error or 'Browser extraction failed — try the CLI tool instead.'}"
+                )
+            return self, None
+
+        if isinstance(msg, ClipboardMsg):
+            if self.screen == Screen.COOKIE:
+                if msg.text:
+                    self.cookie_input = msg.text
+                    self.cookie_status = f"ok:{len(msg.text)} chars read from clipboard — press Enter to save."
+                else:
+                    self.cookie_status = "error:Could not read clipboard. Install xclip, xsel, or wl-paste."
+            elif self.screen == Screen.ADD_BOOK:
+                if msg.text:
+                    self.book_id_input = msg.text.strip()
+                    self.add_book_status = ""
+                else:
+                    self.add_book_status = "error:Could not read clipboard. Install xclip, xsel, or wl-paste."
+            return self, None
+
         return self, None
 
     # ── Key handling ───────────────────────────────────────────────────────
@@ -334,6 +409,7 @@ class AppModel(tea.Model):
 
         dispatch = {
             Screen.MAIN:     self._key_main,
+            Screen.LOGIN:    self._key_login,
             Screen.COOKIE:   self._key_cookie,
             Screen.ADD_BOOK: self._key_add_book,
             Screen.QUEUE:    self._key_queue,
@@ -362,6 +438,38 @@ class AppModel(tea.Model):
             return self, tea.quit_cmd
         return self, None
 
+    def _key_login(self, key: str):
+        if self.login_running:
+            return self, None
+        if key == "escape":
+            self.screen = Screen.MAIN
+            self.login_status = ""
+        elif key in ("tab", "down", "enter") and self.login_field == 0:
+            self.login_field = 1
+        elif key in ("shift+tab", "up") and self.login_field == 1:
+            self.login_field = 0
+        elif key == "enter" and self.login_field == 1:
+            self._do_login()
+        elif key in ("backspace", "delete"):
+            if self.login_field == 0:
+                self.login_email = self.login_email[:-1]
+            else:
+                self.login_password = self.login_password[:-1]
+            self.login_status = ""
+        elif key == "ctrl+u":
+            if self.login_field == 0:
+                self.login_email = ""
+            else:
+                self.login_password = ""
+            self.login_status = ""
+        elif len(key) == 1 and key.isprintable():
+            if self.login_field == 0:
+                self.login_email += key
+            else:
+                self.login_password += key
+            self.login_status = ""
+        return self, None
+
     def _key_cookie(self, key: str):
         if key == "escape":
             self.screen = Screen.MAIN
@@ -373,6 +481,10 @@ class AppModel(tea.Model):
         elif key == "ctrl+u":
             self.cookie_input = ""
             self.cookie_status = ""
+        elif key == "ctrl+v":
+            self._read_clipboard()
+        elif key in ("b", "B") and not self.cookie_retrieving:
+            self._retrieve_from_browser()
         elif len(key) == 1:
             self.cookie_input += key
             self.cookie_status = ""
@@ -387,6 +499,11 @@ class AppModel(tea.Model):
         elif key == "backspace":
             self.book_id_input = self.book_id_input[:-1]
             self.add_book_status = ""
+        elif key == "ctrl+u":
+            self.book_id_input = ""
+            self.add_book_status = ""
+        elif key == "ctrl+v":
+            self._read_clipboard_book()
         elif len(key) == 1 and key.isprintable():
             self.book_id_input += key
             self.add_book_status = ""
@@ -399,6 +516,9 @@ class AppModel(tea.Model):
             self.screen = Screen.ADD_BOOK
         elif key in ("r", "R"):
             self._start_downloads()
+        elif key in ("s", "S"):
+            self.screen = Screen.COOKIE
+            self.cookie_status = ""
         elif key in ("c", "C"):
             # clear queue
             self.queue.clear()
@@ -415,54 +535,122 @@ class AppModel(tea.Model):
 
     # ── Business logic ─────────────────────────────────────────────────────
 
+    def _do_login(self):
+        email = self.login_email.strip()
+        password = self.login_password
+        if not email:
+            self.login_status = "error:Please enter your email."
+            self.login_field = 0
+            return
+        if not password:
+            self.login_status = "error:Please enter your password."
+            return
+        self.login_running = True
+        self.login_status = ""
+
+        def _worker():
+            cookies = login_with_credentials(email, password)
+            self._program.send(LoginResultMsg(
+                cookies=cookies,
+                error="" if cookies else "Login failed — check your credentials.",
+            ))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
     def _save_cookie(self):
         raw = self.cookie_input.strip()
         if not raw:
             self.cookie_status = "error:No cookie value entered."
             return
-
-        # Strip leading "Cookie: " label if the user copied the whole header line
-        for prefix in ("Cookie: ", "cookie: ", "Cookie:", "cookie:"):
-            if raw.startswith(prefix):
-                raw = raw[len(prefix):].strip()
-                break
-
-        # Accept either a JSON dict or a key=value; key=value string
-        if raw.startswith("{"):
-            try:
-                cookies = json.loads(raw)
-            except json.JSONDecodeError:
-                self.cookie_status = "error:Invalid JSON cookie format."
-                return
-        else:
-            # Set-Cookie attribute names to ignore (they're not session cookies)
-            _SKIP = frozenset(("path", "domain", "expires", "max-age",
-                               "samesite", "httponly", "secure", "version"))
-            cookies = {}
-            # Try semicolon first, fall back to newline (some copy tools use it)
-            for sep in (";", "\n"):
-                for pair in raw.split(sep):
-                    pair = pair.strip()
-                    if "=" in pair:
-                        k, _, v = pair.partition("=")
-                        k = k.strip()
-                        if k.lower() not in _SKIP:
-                            cookies[k] = v.strip()
-                if cookies:
-                    break
-
+        try:
+            cookies = parse_cookie_string(raw)
+        except json.JSONDecodeError:
+            self.cookie_status = "error:Invalid JSON format."
+            return
+        except Exception as exc:
+            self.cookie_status = f"error:Parse error: {exc}"
+            return
         if not cookies:
             self.cookie_status = (
-                "error:Could not parse cookies. "
-                "Paste the Cookie header value: name=value; name2=value2"
+                "error:Could not parse cookies — paste the full Cookie header value."
             )
             return
-
         with open(COOKIES_FILE, "w") as f:
             json.dump(cookies, f)
         self.cookie_saved = True
         self.cookie_input = ""
-        self.cookie_status = "ok:Cookie saved successfully."
+        self.cookie_status = "ok:Saved."
+
+    def _retrieve_from_browser(self):
+        self.cookie_retrieving = True
+        self.cookie_status = ""
+
+        def _worker():
+            cookies = get_oreilly_cookies_from_browser()
+            self._program.send(BrowserCookieMsg(
+                cookies=cookies,
+                error="" if cookies else "No O'Reilly cookies found in browser.",
+            ))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _read_clipboard(self):
+        """Read clipboard content via system tools and deliver as ClipboardMsg."""
+        self.cookie_status = "ok:Reading clipboard…"
+
+        def _worker():
+            _cmds = [
+                ["wl-paste", "--no-newline"],
+                ["xclip", "-selection", "clipboard", "-o"],
+                ["xsel", "--clipboard", "--output"],
+            ]
+            for cmd in _cmds:
+                try:
+                    result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+                    if result.returncode == 0 and result.stdout.strip():
+                        self._program.send(ClipboardMsg(result.stdout.strip()))
+                        return
+                except (FileNotFoundError, subprocess.TimeoutExpired):
+                    continue
+            self._program.send(ClipboardMsg(""))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _read_clipboard_book(self):
+        """Read clipboard content and deliver as ClipboardMsg for the add-book screen."""
+        def _worker():
+            _cmds = [
+                ["wl-paste", "--no-newline"],
+                ["xclip", "-selection", "clipboard", "-o"],
+                ["xsel", "--clipboard", "--output"],
+            ]
+            for cmd in _cmds:
+                try:
+                    result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+                    if result.returncode == 0 and result.stdout.strip():
+                        self._program.send(ClipboardMsg(result.stdout.strip()))
+                        return
+                except (FileNotFoundError, subprocess.TimeoutExpired):
+                    continue
+            self._program.send(ClipboardMsg(""))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _cookie_age_mins(self) -> int:
+        """Minutes since cookies.json was last written, or -1 if file is missing."""
+        if not os.path.isfile(COOKIES_FILE):
+            return -1
+        return int((time.time() - os.path.getmtime(COOKIES_FILE)) / 60)
+
+    def _cookie_age_str(self) -> str:
+        mins = self._cookie_age_mins()
+        if mins < 0:
+            return ""
+        if mins < 1:
+            return "< 1 min ago"
+        if mins == 1:
+            return "1 min ago"
+        return f"{mins} min ago"
 
     def _add_book_to_queue(self):
         book_id = self.book_id_input.strip()
@@ -483,7 +671,7 @@ class AppModel(tea.Model):
         if not self.queue:
             return
         if not os.path.isfile(COOKIES_FILE):
-            self.status_msg = "No cookies.json found — set your cookie first."
+            self.status_msg = "No cookies.json found — press 's' to set your cookie first."
             return
 
         # Initialise state entries
@@ -553,6 +741,7 @@ class AppModel(tea.Model):
     def view(self) -> str:
         views = {
             Screen.MAIN:     self._view_main,
+            Screen.LOGIN:    self._view_login,
             Screen.COOKIE:   self._view_cookie,
             Screen.ADD_BOOK: self._view_add_book,
             Screen.QUEUE:    self._view_queue,
@@ -563,7 +752,7 @@ class AppModel(tea.Model):
         return render() + "\n"
 
     def _header(self, subtitle: str = "") -> str:
-        title = title_style.render("  SafariBooks  ")
+        title = title_style.render("  KeroOle  ")
         if subtitle:
             sub = Style().foreground(C_MUTED).render(f"  {subtitle}")
             return join_horizontal(Top, title, sub)
@@ -577,9 +766,17 @@ class AppModel(tea.Model):
     def _view_main(self) -> str:
         lines = [self._header(), ""]
 
-        # Cookie status badge
-        if self.cookie_saved:
-            badge = success_style.render("● Cookie: saved")
+        # Cookie status badge — always read from disk so external saves are reflected
+        cookie_exists = os.path.isfile(COOKIES_FILE)
+        if cookie_exists:
+            age_mins = self._cookie_age_mins()
+            age_str  = self._cookie_age_str()
+            if age_mins > 15:
+                badge = Style().foreground(C_YELLOW).bold(True).render(
+                    f"● Cookie: saved ({age_str}) ⚠ may be expired"
+                )
+            else:
+                badge = success_style.render(f"● Cookie: saved ({age_str})")
         else:
             badge = error_style.render("○ Cookie: not set")
         lines.append("  " + badge)
@@ -601,19 +798,93 @@ class AppModel(tea.Model):
         content = "\n".join(lines)
         return panel_style.width(min(self.width - 4, 60)).render(content)
 
+    # Login screen ────────────────────────────────────────────────────────────
+
+    def _view_login(self) -> str:
+        lines = [self._header("Login with Email/Password"), ""]
+
+        # Current cookie status
+        if os.path.isfile(COOKIES_FILE):
+            age_str = self._cookie_age_str()
+            lines.append(success_style.render(f"● Already logged in ({age_str}) — log in again to refresh"))
+        else:
+            lines.append(hint_style.render("○ No session saved — enter credentials below"))
+        lines.append("")
+
+        box_w = min(self.width - 12, 48)
+
+        def _field(label: str, value: str, focused: bool, masked: bool = False) -> str:
+            display = ("*" * len(value)) if masked else value
+            cursor  = "█" if focused else ""
+            border_color = C_ACCENT if focused else C_MUTED
+            box = (
+                Style()
+                .border(normal_border())
+                .border_foreground(border_color)
+                .padding(0, 1)
+                .width(box_w)
+                .render(display + cursor)
+            )
+            lbl = (accent_style if focused else label_style).render(label)
+            return lbl + "\n" + box
+
+        lines.append(_field("Email", self.login_email, self.login_field == 0))
+        lines.append("")
+        lines.append(_field("Password", self.login_password, self.login_field == 1, masked=True))
+        lines.append("")
+
+        if self.login_running:
+            lines.append(Style().foreground(C_YELLOW).render("  ⟳  Logging in…"))
+        elif self.login_status:
+            kind, _, msg = self.login_status.partition(":")
+            if kind == "ok":
+                lines.append(success_style.render("✓ " + msg))
+            else:
+                lines.append(error_style.render("✗ " + msg))
+        lines.append("")
+
+        lines.append(self._footer("Tab/↓  next field    Enter  submit    Ctrl+U  clear    Esc  back"))
+        content = "\n".join(lines)
+        return panel_style.width(min(self.width - 4, 60)).render(content)
+
     # Cookie screen ───────────────────────────────────────────────────────────
 
     def _view_cookie(self) -> str:
         lines = [self._header("Set Session Cookie"), ""]
 
-        lines.append(label_style.render("How to get your cookie:"))
-        lines.append(label_style.render("  1. Open Chrome/Firefox DevTools (F12) → Network tab"))
-        lines.append(label_style.render("  2. Visit learning.oreilly.com and make sure you're logged in"))
-        lines.append(label_style.render("  3. Click any request → Headers → Request Headers → Cookie"))
-        lines.append(label_style.render("  4. Copy the value (everything after 'Cookie: ')"))
-        lines.append(hint_style.render("  Format:  orm-jwt=eyJ…; orm-rt=eyJ…; _sp=…"))
+        # Current file status — reflects CLI saves too
+        cookie_exists = os.path.isfile(COOKIES_FILE)
+        if cookie_exists:
+            age_str = self._cookie_age_str()
+            age_mins = self._cookie_age_mins()
+            if age_mins > 15:
+                lines.append(Style().foreground(C_YELLOW).bold(True).render(
+                    f"● cookies.json saved ({age_str}) ⚠ may be expired — update below"
+                ))
+            else:
+                lines.append(success_style.render(
+                    f"● cookies.json saved ({age_str}) ✓ — ready, or update below"
+                ))
+        else:
+            lines.append(error_style.render("○ cookies.json not found — set a cookie below"))
         lines.append("")
-        lines.append(label_style.render("Paste below (Ctrl+Shift+V / terminal bracketed paste):"))
+
+        # Option 1: browser auto-retrieve
+        lines.append(accent_style.render("Option 1 — Auto-retrieve from browser  [press b]"))
+        if self.cookie_retrieving:
+            lines.append(Style().foreground(C_YELLOW).render("  ⟳  Retrieving cookies from browser…"))
+        else:
+            lines.append(label_style.render("  Reads Chrome/Firefox cookies directly from disk."))
+            lines.append(hint_style.render("  May fail over SSH or if Chrome is still running — use Option 2 then."))
+        lines.append("")
+
+        # Option 2: paste from DevTools
+        lines.append(accent_style.render("Option 2 — Paste from DevTools  [Ctrl+V or Enter to save]"))
+        lines.append(label_style.render("  1. DevTools (F12) → Network → any learning.oreilly.com request"))
+        lines.append(label_style.render("  2. Headers → Request Headers → right-click Cookie → Copy value"))
+        lines.append(label_style.render("  3. Press Ctrl+V to read from clipboard, then Enter to save"))
+        lines.append(hint_style.render("  Tip: if Ctrl+V fails, use the CLI (most reliable for long cookies):"))
+        lines.append(hint_style.render("       xclip -o | python3 retrieve_cookies.py --stdin"))
         lines.append("")
 
         # Input display — show last 60 chars + character count
@@ -642,7 +913,7 @@ class AppModel(tea.Model):
                 lines.append(error_style.render("✗ " + msg))
             lines.append("")
 
-        lines.append(self._footer("Enter  save    Backspace  clear last char    Esc  back"))
+        lines.append(self._footer("Enter  save    Ctrl+V  paste    b  browser    Backspace  clear    Esc  back"))
         content = "\n".join(lines)
         return panel_style.width(min(self.width - 4, 72)).render(content)
 
@@ -675,7 +946,7 @@ class AppModel(tea.Model):
                 lines.append(error_style.render("✗ " + msg))
             lines.append("")
 
-        lines.append(self._footer("Enter  add    Esc  back"))
+        lines.append(self._footer("Enter  add    Ctrl+V  paste    Esc  back"))
         content = "\n".join(lines)
         return panel_style.width(min(self.width - 4, 60)).render(content)
 
@@ -692,15 +963,25 @@ class AppModel(tea.Model):
 
         lines.append("")
 
-        if not self.cookie_saved:
-            lines.append(error_style.render("  ⚠  Cookie not set — run will fail."))
-            lines.append("")
+        cookie_exists = os.path.isfile(COOKIES_FILE)
+        if not cookie_exists:
+            lines.append(error_style.render("  ⚠  Cookie not set — press 's' to set one before running."))
+        else:
+            age_mins = self._cookie_age_mins()
+            age_str  = self._cookie_age_str()
+            if age_mins > 15:
+                lines.append(Style().foreground(C_YELLOW).bold(True).render(
+                    f"  ⚠  Cookie saved {age_str} — may be expired.  Press 's' to refresh."
+                ))
+            else:
+                lines.append(success_style.render(f"  ● Cookie ready  ({age_str})"))
+        lines.append("")
 
         if self.status_msg:
             lines.append(error_style.render("  " + self.status_msg))
             lines.append("")
 
-        lines.append(self._footer("a  add book    r  run queue    c  clear    Esc  back"))
+        lines.append(self._footer("a  add    r  run    s  set cookie    c  clear    Esc  back"))
         content = "\n".join(lines)
         return panel_style.width(min(self.width - 4, 60)).render(content)
 
